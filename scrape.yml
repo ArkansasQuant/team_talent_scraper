@@ -1,0 +1,100 @@
+name: scrape-rosters
+
+# Manual trigger only — no cron, since this is a one-shot historical scrape.
+# After you have 2018-2025 in hand, set up a small yearly refresh workflow
+# separately if you want.
+on:
+  workflow_dispatch:
+    inputs:
+      seasons:
+        description: 'Seasons to scrape (space-separated), e.g. "2018 2019 2020"'
+        required: true
+        default: '2018 2019 2020 2021 2022 2023 2024 2025'
+      teams:
+        description: 'Optional: specific teams (canonical name, space-separated). Leave blank for all FBS.'
+        required: false
+        default: ''
+      force:
+        description: 'Force re-scrape (ignore checkpoints)'
+        required: false
+        default: 'false'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # Max GitHub-hosted runner limit is 6 hours. Full 2018-2025 run is ~2 hrs.
+    # Set explicit timeout to fail fast if things hang.
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright + Chromium
+        run: |
+          playwright install --with-deps chromium
+
+      # Restore previous checkpoints so a re-run picks up where we left off.
+      # This is the overnight-safety net: if a scrape dies at team 600/1088,
+      # the next dispatch resumes from team 601 instead of restarting.
+      - name: Restore checkpoints cache
+        uses: actions/cache@v4
+        id: ckpt-cache
+        with:
+          path: checkpoints/
+          # Key changes when the input seasons change so we don't cross-contaminate runs.
+          key: checkpoints-${{ hashFiles('team_urls.py') }}-${{ github.event.inputs.seasons }}
+          restore-keys: |
+            checkpoints-${{ hashFiles('team_urls.py') }}-
+
+      - name: Run scraper
+        env:
+          SEASONS: ${{ github.event.inputs.seasons }}
+          TEAMS:   ${{ github.event.inputs.teams }}
+          FORCE:   ${{ github.event.inputs.force }}
+        run: |
+          ARGS="--seasons $SEASONS --output roster_full.csv"
+          if [ -n "$TEAMS" ]; then ARGS="$ARGS --teams $TEAMS"; fi
+          if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
+          echo "Running: python scrape_rosters.py $ARGS"
+          python scrape_rosters.py $ARGS 2>&1 | tee scrape.log
+
+      # Always save checkpoints even if the scrape itself failed,
+      # so the next dispatch can resume.
+      - name: Save checkpoints cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: checkpoints/
+          key: checkpoints-${{ hashFiles('team_urls.py') }}-${{ github.event.inputs.seasons }}-${{ github.run_id }}
+
+      # Upload the final CSV + log as an artifact. Artifacts expire after 90 days
+      # by default — download and commit the CSV to the repo once you're satisfied.
+      - name: Upload roster CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roster_full
+          path: |
+            roster_full.csv
+            scrape.log
+          retention-days: 30
+
+      - name: Upload checkpoints
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkpoints
+          path: checkpoints/
+          retention-days: 30
