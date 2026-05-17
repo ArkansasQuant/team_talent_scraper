@@ -1,13 +1,10 @@
 name: scrape-rosters
 
-# Manual trigger. The "seasons" input controls the matrix below — pick a
-# single season, several, "all", or a "YYYY-YYYY" range. Each season runs
-# in its own parallel job (each gets a fresh 6-hour GitHub Actions clock).
 on:
   workflow_dispatch:
     inputs:
       seasons:
-        description: 'Seasons: "all", a single year ("2024"), a range ("2018-2026"), or comma list ("2018,2019,2024")'
+        description: 'Seasons: "all", a single year ("2024"), or comma list ("2018,2019,2024")'
         required: true
         default: 'all'
       teams:
@@ -15,28 +12,23 @@ on:
         required: false
         default: ''
       skip_profiles:
-        description: 'Skip per-player profile enrichment (much faster, no transfer fields)'
+        description: 'Skip per-player profile enrichment (much faster, no transfer/HS fields)'
         required: false
         default: 'false'
       profile_concurrency:
-        description: 'Concurrent profile fetches per team-season (default 4)'
+        description: 'Concurrent profile fetches per team-season (default 6)'
         required: false
-        default: '4'
+        default: '6'
       force:
         description: 'Force re-scrape (ignore existing checkpoints)'
         required: false
         default: 'false'
 
-# Allow another scrape to queue without cancelling the in-progress run.
 concurrency:
   group: scrape-rosters-${{ github.event.inputs.seasons }}
   cancel-in-progress: false
 
 jobs:
-  # ---------------------------------------------------------------
-  # Job 1: parse the "seasons" input into a JSON matrix array.
-  # Each season runs in its own job so each gets a fresh 6-hour clock.
-  # ---------------------------------------------------------------
   setup:
     runs-on: ubuntu-latest
     outputs:
@@ -46,13 +38,8 @@ jobs:
         id: build
         run: |
           INPUT="${{ github.event.inputs.seasons }}"
-          # Accept "all", "YYYY", "YYYY-YYYY", or comma/space list.
           if [ "$INPUT" = "all" ]; then
-            SEASONS="2018 2019 2020 2021 2022 2023 2024 2025 2026"
-          elif echo "$INPUT" | grep -qE '^[0-9]{4}-[0-9]{4}$'; then
-            LO=$(echo "$INPUT" | cut -d- -f1)
-            HI=$(echo "$INPUT" | cut -d- -f2)
-            SEASONS=$(seq "$LO" "$HI" | tr '\n' ' ')
+            SEASONS="2018 2019 2020 2021 2022 2023 2024 2025"
           else
             SEASONS=$(echo "$INPUT" | tr ',' ' ')
           fi
@@ -60,18 +47,13 @@ jobs:
           echo "Resolved seasons: $JSON"
           echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------
-  # Job 2: one scrape job PER SEASON (parallel). Each writes a single
-  # timestamped XLSX with sheets: Players, Diagnostics, Team_Summary,
-  # Failed_URLs, Run_Info.
-  # ---------------------------------------------------------------
   scrape:
     needs: setup
     runs-on: ubuntu-latest
-    timeout-minutes: 350      # GitHub-hosted runners cap at 6 hours
+    timeout-minutes: 350
     strategy:
-      fail-fast: false        # one season failing shouldn't kill the others
-      max-parallel: 4         # be polite to 247sports
+      fail-fast: false
+      max-parallel: 4
       matrix:
         season: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
@@ -89,15 +71,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install openpyxl
 
       - name: Install Playwright + Chromium
         run: |
           playwright install --with-deps chromium
 
-      # Restore previous checkpoints + the global profile cache so a
-      # re-dispatch resumes mid-scrape instead of starting over.
-      # Cache is keyed per-season AND per-source-hash so a code change
-      # automatically invalidates and re-fetches.
       - name: Restore checkpoints cache
         uses: actions/cache@v4
         id: ckpt-cache
@@ -116,18 +95,13 @@ jobs:
           PROFILE_CONCURRENCY: ${{ github.event.inputs.profile_concurrency }}
           FORCE:               ${{ github.event.inputs.force }}
         run: |
-          # Timestamped per-season XLSX, e.g. roster_2024_20260501T130636.xlsx
-          TS=$(date -u +%Y%m%dT%H%M%S)
-          OUT="roster_${SEASON}_${TS}.xlsx"
-          ARGS="--seasons $SEASON --output $OUT"
-          ARGS="$ARGS --profile-concurrency ${PROFILE_CONCURRENCY:-4}"
+          ARGS="--seasons $SEASON --output roster_${SEASON}.csv"
+          ARGS="$ARGS --profile-concurrency ${PROFILE_CONCURRENCY:-6}"
           if [ -n "$TEAMS" ]; then ARGS="$ARGS --teams $TEAMS"; fi
           if [ "$SKIP_PROFILES" = "true" ]; then ARGS="$ARGS --skip-profiles"; fi
           if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
           echo "Running: python scrape_rosters.py $ARGS"
           python scrape_rosters.py $ARGS 2>&1 | tee scrape_${SEASON}.log
-          # Save the actual output filename for the upload step
-          echo "OUT_XLSX=$OUT" >> "$GITHUB_ENV"
 
       - name: Save checkpoints cache
         if: always()
@@ -136,29 +110,16 @@ jobs:
           path: checkpoints/
           key: checkpoints-${{ matrix.season }}-${{ hashFiles('team_urls.py', 'scrape_rosters.py') }}-${{ github.run_id }}
 
-      - name: Upload roster XLSX for season ${{ matrix.season }}
+      - name: Upload per-season CSV (intermediate)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: roster_${{ matrix.season }}
+          name: per-season-${{ matrix.season }}
           path: |
-            roster_${{ matrix.season }}_*.xlsx
+            roster_${{ matrix.season }}.csv
             scrape_${{ matrix.season }}.log
-          retention-days: 30
+          retention-days: 7
 
-      - name: Upload checkpoints for season ${{ matrix.season }}
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: checkpoints_${{ matrix.season }}
-          path: checkpoints/
-          retention-days: 30
-
-  # ---------------------------------------------------------------
-  # Job 3: combine all per-season XLSX files into a single workbook
-  # once every season job has finished. Runs even if some seasons
-  # failed — you'll just get a partial combined workbook.
-  # ---------------------------------------------------------------
   combine:
     needs: scrape
     if: always()
@@ -170,81 +131,53 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install pandas + openpyxl
+      - name: Install deps
         run: pip install pandas openpyxl
 
-      - name: Download all per-season roster artifacts
+      - name: Download all per-season artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: roster_*
+          pattern: per-season-*
           path: per_season/
           merge-multiple: true
 
-      - name: Combine into roster_full XLSX
+      - name: Combine into single roster_full.xlsx (one sheet)
         run: |
           python - <<'PY'
-          import glob
-          from datetime import datetime
-          import pandas as pd
-
-          files = sorted(glob.glob('per_season/roster_*.xlsx'))
+          import glob, pandas as pd, os, datetime
+          files = sorted(glob.glob('per_season/roster_*.csv'))
           if not files:
-              print("No per-season XLSX files found — nothing to combine.")
+              print("No per-season CSVs found — nothing to combine.")
               raise SystemExit(0)
-
-          all_players, all_diag, all_team, all_failed, all_info = [], [], [], [], []
+          dfs = []
           for f in files:
               try:
-                  sheets = pd.read_excel(f, sheet_name=None)
-                  print(f"  {f}: {len(sheets.get('Players', []))} players")
-                  if 'Players' in sheets:
-                      all_players.append(sheets['Players'])
-                  if 'Diagnostics' in sheets:
-                      all_diag.append(sheets['Diagnostics'])
-                  if 'Team_Summary' in sheets:
-                      all_team.append(sheets['Team_Summary'])
-                  if 'Failed_URLs' in sheets:
-                      all_failed.append(sheets['Failed_URLs'])
-                  if 'Run_Info' in sheets:
-                      info = sheets['Run_Info'].copy()
-                      info['source_file'] = f
-                      all_info.append(info)
+                  df = pd.read_csv(f)
+                  print(f"  {f}: {len(df):,} rows")
+                  dfs.append(df)
               except Exception as e:
                   print(f"  WARN: could not read {f}: {e}")
-
-          if not all_players:
-              print("No Players sheets found.")
-              raise SystemExit(0)
-
-          ts = datetime.utcnow().strftime('%Y%m%dT%H%M%S')
-          out = f"roster_full_{ts}.xlsx"
-          full_players = pd.concat(all_players, ignore_index=True)
-          with pd.ExcelWriter(out, engine='openpyxl') as w:
-              full_players.to_excel(w, sheet_name='Players', index=False)
-              if all_diag:
-                  pd.concat(all_diag, ignore_index=True).to_excel(
-                      w, sheet_name='Diagnostics', index=False)
-              if all_team:
-                  pd.concat(all_team, ignore_index=True).to_excel(
-                      w, sheet_name='Team_Summary', index=False)
-              if all_failed:
-                  pd.concat(all_failed, ignore_index=True).to_excel(
-                      w, sheet_name='Failed_URLs', index=False)
-              if all_info:
-                  pd.concat(all_info, ignore_index=True).to_excel(
-                      w, sheet_name='Run_Info', index=False)
-              # Freeze headers on every sheet for easier scrolling
-              for name in w.sheets:
-                  w.sheets[name].freeze_panes = 'A2'
-          print(f"\nWrote {out}: {len(full_players):,} rows  "
-                f"({full_players['season'].nunique()} seasons, "
-                f"{full_players['team'].nunique()} teams)")
+          if dfs:
+              full = pd.concat(dfs, ignore_index=True)
+              ts = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%S')
+              xlsx_path = f'roster_full_{ts}.xlsx'
+              csv_path  = f'roster_full_{ts}.csv'
+              # Real xlsx, single sheet 'Players'
+              with pd.ExcelWriter(xlsx_path, engine='openpyxl') as w:
+                  full.to_excel(w, sheet_name='Players', index=False)
+              # Also CSV for downstream tooling
+              full.to_csv(csv_path, index=False)
+              print(f"\nWrote {xlsx_path}: {len(full):,} rows  "
+                    f"({full['season'].nunique()} seasons, "
+                    f"{full['team'].nunique()} teams)")
           PY
 
-      - name: Upload combined roster
+      - name: Upload combined roster (single artifact, single sheet xlsx)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: roster_full
-          path: roster_full_*.xlsx
-          retention-days: 30
+          path: |
+            roster_full_*.xlsx
+            roster_full_*.csv
+          retention-days: 90
