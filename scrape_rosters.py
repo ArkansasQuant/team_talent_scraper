@@ -1,21 +1,26 @@
 """
 Scrape active rosters for all FBS teams across seasons from 247sports,
 then enrich each roster row by visiting the player profile to capture
-HS recruiting metadata, transfer-portal metadata, and NFL draft info.
+HS recruiting metadata and transfer-portal metadata.
+
+NFL draft info is NOT scraped — 247sports player profiles do not include
+draft data. (If a "Drafted by X, Round Y, Pick Z" mention appears anywhere
+on the page, it's from the global site navigation chrome, not the player.)
+Draft enrichment will be handled by a separate scraper against a different
+data source if/when we add it.
 
 Design principles (from scraping playbook):
   - Playwright + domcontentloaded (NOT networkidle)
   - Randomized delays + user-agent rotation
   - NEVER break-on-exception in loops — use continue + failure counter
   - Per-team-season checkpointing for crash recovery
-  - GLOBAL profile cache keyed by (247_id, team_canonical) — different
-    team views of the same player are cached separately. Profile content
-    on 247 depends on the /college-{id}/ URL suffix, so the same player
-    on Ohio State 2019 vs Alabama 2021 needs to be fetched twice and
-    cached as two entries. Previously the cache was keyed by 247_id alone,
-    causing alphabetically-first team views to poison all later team rows.
-  - Cache flushed to disk after every team-season so a mid-run crash
-    can resume without re-scraping any profiles
+  - GLOBAL profile cache keyed by 247_id only — content for a given player
+    is consistent enough across team-views that one fetch suffices; the
+    /college-{id}/ URL suffix matters mostly for the .team-info-section and
+    .commit-banner, which are profile-level (not season-level) fields we
+    write once per cache entry.
+  - Cache flushed to disk after every team-season so a mid-run crash can
+    resume without re-scraping any profiles
   - Profile fetches run concurrently (asyncio.Semaphore)
   - Post-run verification (row counts, ID format, null-ratio sanity)
 
@@ -64,10 +69,12 @@ PROFILE_DELAY_MIN = 0.3
 PROFILE_DELAY_MAX = 1.0
 
 # Bump this whenever the cache schema changes so old caches get thrown out.
-# Schema 5 changes:
-#   - Cache key is now "{player_id}:{team_canonical}" (was just "{player_id}")
-#   - profile dict now includes prospect_event and draft_info fields
-PROFILE_CACHE_SCHEMA = 5
+# Schema 6 changes:
+#   - Cache key reverted to just "{player_id}" (was "{player_id}:{team_canonical}")
+#   - profile dict drops draft_info (247 profiles don't have draft data)
+#   - prospect_event parser now flexes to handle "247Sports Composite®" title
+#   - N/A values filtered out in _parse_one_section
+PROFILE_CACHE_SCHEMA = 6
 
 CHECKPOINT_DIR = Path("checkpoints")
 PROFILE_CACHE_FILE = CHECKPOINT_DIR / "profiles_cache.json"
@@ -75,7 +82,6 @@ PROFILE_CACHE_FILE = CHECKPOINT_DIR / "profiles_cache.json"
 # Regex to extract 247 ID from player URL, e.g. /player/carlton-martial-91227/
 PLAYER_URL_RE = re.compile(r'/player/([^/]*?)-(\d+)/?$')
 
-# Columns added by the profile enrichment step
 TRANSFER_FIELDS = [
     'transfer_origin_team',
     'transfer_destination_team',
@@ -87,28 +93,19 @@ TRANSFER_FIELDS = [
     'transfer_stars',
 ]
 
-# HS / recruiting fields (NEW — section: 247Sports or JUCO)
 HS_FIELDS = [
     'hs_class_year',           # (YYYY) from the prospect rank-block
-    'hs_composite_rating',     # numeric 247 composite rating, e.g. "95"
+    'hs_composite_rating',     # numeric 247 composite rating
     'hs_national_rank',        # national rank — JUCO ranks suffixed " (JUCO)"
     'hs_position_rank',        # position rank — JUCO ranks suffixed " (JUCO)"
     'hs_position',             # position from prospect section
     'hs_stars',                # 1-5 or 'JUCO'
-    'hs_section_kind',         # '247Sports' or 'JUCO'
-]
-
-# NFL draft fields (NEW)
-DRAFT_FIELDS = [
-    'draft_year',
-    'draft_round',
-    'draft_pick',
-    'draft_team',
+    'hs_section_kind',         # '247Sports' or '247Sports Composite' or 'JUCO'
 ]
 
 # profile_scraped is one of:
 #   'ok'              — fetched + parsed; matching transfer event applied
-#   'ok_no_transfer'  — fetched + parsed but no transfer event applies for this season
+#   'ok_no_transfer'  — fetched + parsed but no transfer event applies
 #   'failed'          — fetch error after all retries
 #   'no_url'          — row had no profile URL (placeholder/walk-on)
 #   'skipped'         — enrichment was disabled
@@ -118,18 +115,23 @@ ALL_OUTPUT_COLS = [
     '247_id', 'player_name', 'team', 'season', 'jersey', 'position',
     'height', 'weight', 'class_yr', 'age', 'high_school',
     'profile_url', 'scrape_ts',
-] + HS_FIELDS + TRANSFER_FIELDS + DRAFT_FIELDS + STATUS_FIELDS
+] + HS_FIELDS + TRANSFER_FIELDS + STATUS_FIELDS
+
+
+def _na(s):
+    """True if a parsed value should be treated as missing.
+    247 renders 'N/A' (sometimes whitespace-padded) for sections that have
+    no data — we don't want to store those as if they were real values.
+    """
+    if s is None:
+        return True
+    s = str(s).strip().upper()
+    return s in ('', 'N/A', 'NA', '—', '–', '-')
 
 
 # ---------- Roster page extraction ----------
 def parse_roster_html(html, team, season):
-    """
-    Extract roster rows from a team roster page.
-
-    Returns a list of dicts, one per roster entry. Combines the player-link
-    list (which has names + 247 IDs) with the jersey table (which has
-    position, height, weight, class year, HS, rating) by row order.
-    """
+    """Extract roster rows from a team roster page."""
     soup = BeautifulSoup(html, 'lxml')
     rows = []
 
@@ -147,8 +149,8 @@ def parse_roster_html(html, team, season):
             )
             name = a.get_text(strip=True)
             if name:
-                # 247 returns absolute hrefs (https://247sports.com/...) and
-                # relative ones. Detect to avoid double-prefixing.
+                # 247 returns absolute hrefs and relative ones. Detect to
+                # avoid double-prefixing.
                 if href.startswith('http://') or href.startswith('https://'):
                     full_url = href.rstrip('/') + '/'
                 else:
@@ -180,7 +182,7 @@ def parse_roster_html(html, team, season):
         return []
 
     # 3. Find the longest contiguous window of player anchors equal to the
-    # number of data rows. Score = count of non-null 247_ids in window.
+    # number of data rows. Score = count of non-null 247_ids.
     n = len(data_rows)
     best_window = None
     for i in range(len(player_anchors) - n + 1):
@@ -198,7 +200,6 @@ def parse_roster_html(html, team, season):
 
     # 4. Zip anchors with data rows
     for anchor, data in zip(anchors, data_rows):
-        # Data table cols: Jersey | POS | Height | Weight | Yr | Age | HS | Rating
         data = (data + [''] * 8)[:8]
         jersey, pos, height, weight, yr, age, hs, rating = data
         # Convert "6-2" → 6'2" so Excel doesn't auto-date as 2-Jun
@@ -217,15 +218,10 @@ def parse_roster_html(html, team, season):
             'class_yr': yr,
             'age': age,
             'high_school': hs,
-            # NOTE: roster-table "Rating" column is now derived from profile
-            # data; we don't capture it from the roster table anymore because
-            # the profile gives us a richer breakdown (HS rating, transfer
-            # rating, both with national/position ranks).
             'profile_url': anchor['profile_url'] or '',
             'scrape_ts': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
         }
-        # Initialize all enrichment fields as empty
-        for f in HS_FIELDS + TRANSFER_FIELDS + DRAFT_FIELDS + STATUS_FIELDS:
+        for f in HS_FIELDS + TRANSFER_FIELDS + STATUS_FIELDS:
             row[f] = ''
         rows.append(row)
     return rows
@@ -236,9 +232,7 @@ def _parse_one_section(section, is_juco_title):
     """Parse a single rankings-section into a normalized event dict.
 
     Captures rating, year, overall_rank, national_rank, position_rank,
-    position, stars. The national_rank field is populated separately from
-    position_rank so prospect sections (which have NATL labels) can use it,
-    while transfer sections (which don't) leave it blank.
+    position, stars. N/A values are filtered to empty strings.
     """
     out = {
         'kind': '', 'rating': '', 'year': None,
@@ -249,10 +243,11 @@ def _parse_one_section(section, is_juco_title):
     rating_block = section.select_one('.rank-block')
     if rating_block:
         rating_text = rating_block.get_text(' ', strip=True)
-        m_rating = re.match(r'^\s*(\d+(?:\.\d+)?)', rating_text)
-        if m_rating:
-            out['rating'] = m_rating.group(1)
-        m_year = re.search(r'\((\d{4})\)', rating_text)
+        if not _na(rating_text):
+            m_rating = re.match(r'^\s*(\d+(?:\.\d+)?)', rating_text)
+            if m_rating:
+                out['rating'] = m_rating.group(1)
+        m_year = re.search(r'\((\d{4})\)', rating_text or '')
         if m_year:
             out['year'] = int(m_year.group(1))
 
@@ -272,98 +267,50 @@ def _parse_one_section(section, is_juco_title):
             continue
         label = bold.get_text(strip=True).upper()
         value = strong.get_text(strip=True)
+        if _na(value):
+            continue
         link = li.find('a')
         href = (link.get('href', '') if link else '')
 
         if 'OVR' in label or 'OVERALL' in label:
             out['overall_rank'] = value
         elif 'NATL' in label or 'NATIONAL' in label:
-            # National rank — populated for prospect/JUCO sections
             out['national_rank'] = value
         elif 'State=' in href:
-            # State rank — skip
             continue
         elif not out['position_rank']:
-            # First remaining rank = position rank
             out['position_rank'] = value
             out['position'] = label
     return out
 
 
-def _parse_draft_info(soup, full_text):
-    """Extract NFL draft year, round, pick, and team.
-
-    247 displays draft info as a banner near the top of the profile when a
-    player has been drafted. Format examples seen:
-      "Drafted by Detroit Lions — Round 1, Pick 12 (2022 NFL Draft)"
-      "12th overall pick by Detroit Lions in the 2022 NFL Draft (Round 1)"
-      Banner element classes include .draft-banner, .draft-info, .player-draft
-    """
-    out = {'draft_year': '', 'draft_round': '', 'draft_pick': '', 'draft_team': ''}
-
-    # Strategy 1: look for explicit draft banner / section
-    banner = (soup.select_one('.draft-banner')
-              or soup.select_one('.player-draft')
-              or soup.select_one('[class*="draft-info"]')
-              or soup.select_one('[class*="draft-pick"]'))
-    text = ''
-    if banner:
-        text = banner.get_text(' ', strip=True)
-    else:
-        # Strategy 2: scan the whole page text for "NFL Draft" mentions
-        if 'NFL Draft' in full_text or 'NFL draft' in full_text:
-            # Take a window of text around the FIRST NFL Draft mention
-            idx = full_text.lower().find('nfl draft')
-            start = max(0, idx - 200)
-            end = min(len(full_text), idx + 200)
-            text = full_text[start:end]
-
-    if not text:
-        return out
-
-    # Year — look for 4-digit year near "NFL Draft"
-    m_year = re.search(r'(\d{4})\s+NFL\s+Draft', text, re.IGNORECASE)
-    if m_year:
-        out['draft_year'] = m_year.group(1)
-
-    # Round
-    m_round = re.search(r'Round\s+(\d+)', text, re.IGNORECASE)
-    if m_round:
-        out['draft_round'] = m_round.group(1)
-
-    # Pick — overall pick number
-    m_pick = re.search(r'(?:Pick|Overall)\s+#?(\d+)', text, re.IGNORECASE)
-    if not m_pick:
-        m_pick = re.search(r'#?(\d+)(?:st|nd|rd|th)\s+overall', text, re.IGNORECASE)
-    if m_pick:
-        out['draft_pick'] = m_pick.group(1)
-
-    # Team — "by [Team Name]" or "Drafted by [Team Name]"
-    m_team = re.search(
-        r'(?:Selected|Drafted|Picked)\s+by\s+(?:the\s+)?([A-Z][\w\.\' ]+?)'
-        r'\s+(?:in|—|–|-|\(|with|at)',
-        text,
-    )
-    if m_team:
-        out['draft_team'] = m_team.group(1).strip()
-
-    return out
+def _prospect_event_is_real(ev):
+    """Determine whether a parsed prospect event has any actual data."""
+    if not ev:
+        return False
+    return any([
+        ev.get('rating'),
+        ev.get('overall_rank'),
+        ev.get('national_rank'),
+        ev.get('position_rank'),
+        ev.get('year'),
+        ev.get('stars') and ev.get('stars') not in ('0',),
+    ])
 
 
 def parse_player_profile(html):
     """
-    Pull origin/destination teams, ALL transfer events, the prospect event,
-    and NFL draft info from a profile.
+    Pull origin/destination teams, ALL transfer events, and a prospect event
+    from a profile.
 
-    Returns:
-      {
-        'origin_team': str,
-        'destination_team': str,
-        'transfer_events': [...],
-        'prospect_event': {...} | None,   # 247Sports HS recruiting (prefers JUCO if present)
-        'draft_info': {draft_year, draft_round, draft_pick, draft_team},
-        'section_titles': [...],
-      }
+    Section title variants observed on live profiles (verified via diagnostic):
+      - "247Sports Transfer Rankings"  → transfer (year-specific event)
+      - "247Sports"                    → HS recruiting (sometimes N/A for old walk-ons)
+      - "247Sports Composite®"         → HS composite (more often populated for old profiles)
+      - "JUCO"                         → JUCO recruiting
+
+    For prospect data we capture from BOTH 247Sports and Composite® if present,
+    then pick the one with real data (preferring JUCO if it exists at all).
     """
     soup = BeautifulSoup(html, 'lxml')
     result = {
@@ -371,8 +318,6 @@ def parse_player_profile(html):
         'destination_team': '',
         'transfer_events': [],
         'prospect_event': None,
-        'draft_info': {'draft_year': '', 'draft_round': '',
-                       'draft_pick': '', 'draft_team': ''},
         'section_titles': [],
     }
 
@@ -390,15 +335,18 @@ def parse_player_profile(html):
 
     # Iterate ALL rankings sections. Classify by title content.
     juco_event = None
-    sevenforty_event = None
+    primary_247_event = None        # title == "247Sports" (no Composite, no Transfer)
+    composite_event = None          # title startswith "247Sports Composite"
+
     for section in soup.select('section.rankings-section'):
-        title_tag = section.select_one('h3.title')
+        title_tag = section.select_one('h3.title') or section.select_one('h3')
         if not title_tag:
             continue
         title = title_tag.get_text(strip=True)
         result['section_titles'].append(title)
 
         is_juco = 'JUCO' in title
+
         if 'Transfer' in title:
             ev = _parse_one_section(section, is_juco_title=False)
             ev['kind'] = 'Transfer'
@@ -408,18 +356,34 @@ def parse_player_profile(html):
             ev['kind'] = 'JUCO'
             if juco_event is None:
                 juco_event = ev
-        elif title == '247Sports':
-            ev = _parse_one_section(section, is_juco_title=False)
-            ev['kind'] = '247Sports'
-            if sevenforty_event is None:
-                sevenforty_event = ev
+        elif title.startswith('247Sports'):
+            # Distinguish plain "247Sports" from "247Sports Composite®"
+            if 'Composite' in title:
+                ev = _parse_one_section(section, is_juco_title=False)
+                ev['kind'] = '247Sports Composite'
+                if composite_event is None:
+                    composite_event = ev
+            else:
+                ev = _parse_one_section(section, is_juco_title=False)
+                ev['kind'] = '247Sports'
+                if primary_247_event is None:
+                    primary_247_event = ev
 
-    # Prefer JUCO event if present (more specific data), else 247Sports
-    result['prospect_event'] = juco_event if juco_event else sevenforty_event
-
-    # NFL draft info
-    full_text = soup.get_text(' ', strip=True)
-    result['draft_info'] = _parse_draft_info(soup, full_text)
+    # Prospect event preference order:
+    #   1. JUCO (if any) — most specific
+    #   2. 247Sports if it has real data
+    #   3. 247Sports Composite® if 247Sports was N/A or missing
+    if juco_event:
+        result['prospect_event'] = juco_event
+    elif _prospect_event_is_real(primary_247_event):
+        result['prospect_event'] = primary_247_event
+    elif _prospect_event_is_real(composite_event):
+        result['prospect_event'] = composite_event
+    elif primary_247_event:
+        # Both exist but neither has real data — keep the kind label
+        result['prospect_event'] = primary_247_event
+    elif composite_event:
+        result['prospect_event'] = composite_event
 
     return result
 
@@ -434,30 +398,17 @@ def pick_transfer_event(profile, season):
     events = profile.get('transfer_events') or []
     if not events:
         return None
-    # Dated events at-or-before this season
     dated = [e for e in events if e.get('year') and e['year'] <= season]
     if dated:
         dated.sort(key=lambda e: e.get('year') or 0)
         return dated[-1]
-    # Fallback: undated events — use the LAST one (page order = most-recent-first
-    # on most 247 layouts; if it's the only event we'd rather show it than drop)
     undated = [e for e in events if not e.get('year')]
     if undated:
         return undated[-1]
-    # All remaining events are in the future relative to this season — don't pollute
     return None
 
 
 # ---------- Profile cache ----------
-def _cache_key(player_id, team_canonical):
-    """Cache key combines player_id AND team. Different team views of the
-    same player are different cache entries — 247's profile content depends
-    on the /college-{id}/ in the URL, so caching by player_id alone causes
-    the first-team-wins poisoning bug.
-    """
-    return f"{player_id}:{team_canonical or ''}"
-
-
 def load_profile_cache():
     """Load cached profile lookups."""
     if not PROFILE_CACHE_FILE.exists():
@@ -476,7 +427,7 @@ def load_profile_cache():
             if failed / len(cache) > 0.5:
                 print(f"  Profile cache has {failed/len(cache):.0%} failures — discarding.")
                 return {}
-        print(f"  Loaded {len(cache):,} cached profile views from {PROFILE_CACHE_FILE}")
+        print(f"  Loaded {len(cache):,} cached profiles from {PROFILE_CACHE_FILE}")
         return cache
     except Exception as e:
         print(f"  WARN: could not read profile cache ({e}); starting empty")
@@ -498,9 +449,7 @@ def flush_profile_cache(cache):
 # ---------- Profile fetcher ----------
 def _ensure_college_suffix(url, team_canonical):
     """Append /college-{team_id}/ to a profile URL if it's missing.
-    Required for the team-info-section, commit-banner, AND Transfer section
-    to render correctly on the team-specific view.
-    """
+    Required for .team-info-section and .commit-banner to render."""
     if not url:
         return url
     if '/college-' in url:
@@ -558,25 +507,19 @@ async def fetch_one_profile(context, sem, url, player_id):
                     return {
                         'origin_team': '', 'destination_team': '',
                         'transfer_events': [], 'prospect_event': None,
-                        'draft_info': {'draft_year': '', 'draft_round': '',
-                                       'draft_pick': '', 'draft_team': ''},
                         'section_titles': [],
                         'fetch_status': 'failed', 'fetched_url': url,
                     }
         return {
             'origin_team': '', 'destination_team': '',
             'transfer_events': [], 'prospect_event': None,
-            'draft_info': {'draft_year': '', 'draft_round': '',
-                           'draft_pick': '', 'draft_team': ''},
             'section_titles': [],
             'fetch_status': 'failed', 'fetched_url': url,
         }
 
 
 def _apply_juco_suffix(value, kind):
-    """Return value with ' (JUCO)' suffix when section kind is JUCO.
-    Skips empty values and values that already contain '(JUCO)'.
-    """
+    """Return value with ' (JUCO)' suffix when section kind is JUCO."""
     if not value:
         return value
     if kind == 'JUCO' and '(JUCO)' not in str(value):
@@ -585,9 +528,8 @@ def _apply_juco_suffix(value, kind):
 
 
 def apply_profile_to_row(row, profile, season):
-    """Write HS, transfer, and draft fields from profile into the row."""
+    """Write HS and transfer fields from profile into the row."""
 
-    # Failed fetch: short-circuit with status, no fields populated
     if profile.get('fetch_status') == 'failed':
         row['profile_scraped'] = 'failed'
         return
@@ -602,17 +544,9 @@ def apply_profile_to_row(row, profile, season):
         row['hs_stars'] = pe.get('stars', '') or ''
         year = pe.get('year')
         row['hs_class_year'] = str(year) if year else ''
-        # JUCO suffix on ranks per user request (analysts must see at-a-glance
-        # that ranks 1-100 are NOT comparable to 247Sports ranks 1-3000+)
+        # JUCO suffix on ranks per user requirement
         row['hs_national_rank'] = _apply_juco_suffix(pe.get('national_rank', '') or '', kind)
         row['hs_position_rank'] = _apply_juco_suffix(pe.get('position_rank', '') or '', kind)
-
-    # ----- NFL Draft (always written if profile parsed it) -----
-    draft = profile.get('draft_info') or {}
-    row['draft_year']  = draft.get('draft_year', '') or ''
-    row['draft_round'] = draft.get('draft_round', '') or ''
-    row['draft_pick']  = draft.get('draft_pick', '') or ''
-    row['draft_team']  = draft.get('draft_team', '') or ''
 
     # ----- Origin / Destination teams (profile-level, season-independent) -----
     row['transfer_origin_team'] = profile.get('origin_team', '') or ''
@@ -634,11 +568,10 @@ def apply_profile_to_row(row, profile, season):
 
 
 async def enrich_with_profiles(rows, context, profile_cache, concurrency, season):
-    """Fetch any missing profiles and apply them to rows. Cache key is
-    (player_id, team) so the same player on different teams gets different
-    profile views cached separately.
+    """Fetch any missing profiles and apply them to rows.
+    Cache key is 247_id alone — one fetch per player across all team-seasons.
     """
-    needed = {}     # cache_key -> (url, player_id)
+    needed = {}     # player_id -> url
     for r in rows:
         pid = r.get('247_id') or ''
         url = r.get('profile_url') or ''
@@ -646,36 +579,31 @@ async def enrich_with_profiles(rows, context, profile_cache, concurrency, season
         if not pid:
             r['profile_scraped'] = 'no_url'
             continue
-        key = _cache_key(pid, team)
-        if key in profile_cache:
+        if pid in profile_cache:
             continue
         if not url:
             r['profile_scraped'] = 'no_url'
             continue
         full_url = _ensure_college_suffix(url, team)
-        needed[key] = (full_url, pid)
+        needed[pid] = full_url
 
-    # Fetch missing profiles concurrently
     new_count = 0
     if needed:
         sem = asyncio.Semaphore(concurrency)
         tasks = [fetch_one_profile(context, sem, url, pid)
-                 for url, pid in needed.values()]
+                 for pid, url in needed.items()]
         results = await asyncio.gather(*tasks)
-        for key, res in zip(needed.keys(), results):
-            profile_cache[key] = res
+        for pid, res in zip(needed.keys(), results):
+            profile_cache[pid] = res
             if res.get('fetch_status') == 'ok':
                 new_count += 1
 
-    # Apply cache to rows
     for r in rows:
         pid = r.get('247_id') or ''
-        team = r.get('team', '')
         if not pid:
             continue
-        key = _cache_key(pid, team)
-        if key in profile_cache:
-            apply_profile_to_row(r, profile_cache[key], season)
+        if pid in profile_cache:
+            apply_profile_to_row(r, profile_cache[pid], season)
     return new_count
 
 
@@ -741,16 +669,14 @@ async def run(seasons, teams, output, skip_existing=True,
             ckpt = CHECKPOINT_DIR / str(season) / f"{team_safe}.csv"
 
             if skip_existing and ckpt.exists():
-                # Validate checkpoint. Re-scrape if:
-                #   - missing new schema columns
-                #   - poisoned by legacy doubled-URL bug
-                #   - >50% of profiled rows failed
-                #   - height column is date-corrupted
                 try:
                     head = pd.read_csv(ckpt, nrows=1)
-                    has_new_schema = ('hs_class_year' in head.columns
-                                       and 'draft_year' in head.columns
-                                       and 'hs_composite_rating' in head.columns)
+                    has_new_schema = (
+                        'hs_class_year' in head.columns
+                        and 'hs_composite_rating' in head.columns
+                        # draft_year should NO LONGER be in the schema
+                        and 'draft_year' not in head.columns
+                    )
                     sample = pd.read_csv(
                         ckpt,
                         usecols=lambda c: c in ('profile_url', 'profile_scraped', 'height'),
@@ -786,7 +712,7 @@ async def run(seasons, teams, output, skip_existing=True,
                     continue
                 else:
                     print(f"[{i+1}/{len(tasks)}] BACKFILL {team} {season} "
-                          f"(checkpoint exists but missing new schema)")
+                          f"(checkpoint exists but schema mismatch)")
 
             if i > 0 and i % 30 == 0:
                 await context.close()
@@ -854,7 +780,7 @@ async def run(seasons, teams, output, skip_existing=True,
     if not skip_profiles:
         flush_profile_cache(profile_cache)
 
-    # Consolidate all checkpoints
+    # ---------- Consolidate all checkpoints ----------
     print(f"\nConsolidating checkpoints → {output}")
     dfs = []
     for season in seasons:
@@ -869,8 +795,18 @@ async def run(seasons, teams, output, skip_existing=True,
     if dfs:
         full = pd.concat(dfs, ignore_index=True)
         full = full.reindex(columns=ALL_OUTPUT_COLS)
-        full.to_csv(output, index=False)
-        print(f"Wrote {len(full):,} total rows to {output}")
+        # Write CSV (always — easy combine downstream)
+        csv_path = str(output).rsplit('.', 1)[0] + '.csv'
+        full.to_csv(csv_path, index=False)
+        print(f"Wrote {len(full):,} total rows to {csv_path}")
+        # Also write XLSX if requested
+        if str(output).lower().endswith('.xlsx'):
+            try:
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    full.to_excel(writer, sheet_name='Players', index=False)
+                print(f"Wrote {len(full):,} total rows to {output} (real xlsx, sheet 'Players')")
+            except Exception as e:
+                print(f"  WARN: failed to write xlsx ({e}); CSV is canonical.")
 
         # Post-run validation
         print(f"\n=== Post-run validation ===")
@@ -878,9 +814,7 @@ async def run(seasons, teams, output, skip_existing=True,
         print(f"Rows with 247 ID:    {full['247_id'].notna().sum():,}  "
               f"({full['247_id'].notna().mean():.1%})")
         if not skip_profiles:
-            for f in (['hs_class_year', 'hs_composite_rating', 'hs_national_rank',
-                       'hs_position_rank', 'hs_position', 'hs_stars']
-                      + TRANSFER_FIELDS + DRAFT_FIELDS):
+            for f in (HS_FIELDS + TRANSFER_FIELDS):
                 filled = full[f].astype(str).str.strip().replace('nan', '').ne('').sum()
                 print(f"  {f:32s} filled: {filled:6,}  ({filled/len(full):.1%})")
         print(f"\nRows per season:")
