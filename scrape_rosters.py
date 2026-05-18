@@ -11,14 +11,17 @@ data source if/when we add it.
 
 Design principles (from scraping playbook):
   - Playwright + domcontentloaded (NOT networkidle)
+  - 247 client-side hydrates the rankings-section ~500ms after DOM ready;
+    we wait for .rank-block / .commit-banner content (not the section
+    skeleton) and add a 1.5s belt-and-suspenders sleep to avoid capturing
+    skeleton HTML where the section title is rendered but children are not.
   - Randomized delays + user-agent rotation
   - NEVER break-on-exception in loops — use continue + failure counter
   - Per-team-season checkpointing for crash recovery
   - GLOBAL profile cache keyed by 247_id only — content for a given player
     is consistent enough across team-views that one fetch suffices; the
-    /college-{id}/ URL suffix matters mostly for the .team-info-section and
-    .commit-banner, which are profile-level (not season-level) fields we
-    write once per cache entry.
+    /college-{id}/ URL suffix matters mostly for the .team-info-section
+    and .commit-banner which are profile-level (not season-level) fields.
   - Cache flushed to disk after every team-season so a mid-run crash can
     resume without re-scraping any profiles
   - Profile fetches run concurrently (asyncio.Semaphore)
@@ -61,6 +64,7 @@ DELAY_MAX = 3.0
 NAV_TIMEOUT_MS = 30000
 PROFILE_NAV_TIMEOUT_MS = 30000
 PROFILE_SELECTOR_TIMEOUT_MS = 5000
+PROFILE_POST_LOAD_SLEEP = 1.5    # NEW — gives client-side hydration time to finish
 MAX_CONSECUTIVE_FAILURES = 8
 MAX_RETRIES_PER_PAGE = 3
 MAX_PROFILE_RETRIES = 2
@@ -69,12 +73,11 @@ PROFILE_DELAY_MIN = 0.3
 PROFILE_DELAY_MAX = 1.0
 
 # Bump this whenever the cache schema changes so old caches get thrown out.
-# Schema 6 changes:
-#   - Cache key reverted to just "{player_id}" (was "{player_id}:{team_canonical}")
-#   - profile dict drops draft_info (247 profiles don't have draft data)
-#   - prospect_event parser now flexes to handle "247Sports Composite®" title
-#   - N/A values filtered out in _parse_one_section
-PROFILE_CACHE_SCHEMA = 6
+# Schema 7 changes:
+#   - Profile fetch now waits for .rank-block content hydration instead of
+#     the skeleton section title. Schema 6 cache was poisoned by skeleton-DOM
+#     captures where section title was found but children never loaded.
+PROFILE_CACHE_SCHEMA = 7
 
 CHECKPOINT_DIR = Path("checkpoints")
 PROFILE_CACHE_FILE = CHECKPOINT_DIR / "profiles_cache.json"
@@ -380,7 +383,6 @@ def parse_player_profile(html):
     elif _prospect_event_is_real(composite_event):
         result['prospect_event'] = composite_event
     elif primary_247_event:
-        # Both exist but neither has real data — keep the kind label
         result['prospect_event'] = primary_247_event
     elif composite_event:
         result['prospect_event'] = composite_event
@@ -480,13 +482,22 @@ async def fetch_one_profile(context, sem, url, player_id):
                 await asyncio.sleep(random.uniform(PROFILE_DELAY_MIN, PROFILE_DELAY_MAX))
                 await page.goto(url, timeout=PROFILE_NAV_TIMEOUT_MS,
                                 wait_until='domcontentloaded')
+                # Wait for the rankings section's CONTENT (rank-block / commit-banner)
+                # to hydrate, not just the skeleton section title. 247 client-side
+                # renders .rank-block / <li> rows ~500ms after DOM ready. Without
+                # this wait we capture h3.title='247Sports' but miss every child
+                # element (rank, stars, ranks).
                 try:
                     await page.wait_for_selector(
-                        'section.rankings-section, .name, h1.name',
+                        '.rank-block, .commit-banner',
                         timeout=PROFILE_SELECTOR_TIMEOUT_MS,
                     )
                 except PlaywrightTimeoutError:
                     pass
+                # Belt-and-suspenders: even after the selector appears, give late-
+                # rendering text content (rank-block numbers, <li><strong> values)
+                # another moment to finish hydrating before we snapshot the DOM.
+                await asyncio.sleep(PROFILE_POST_LOAD_SLEEP)
                 html = await page.content()
                 await page.close()
                 if len(html) < 2000:
@@ -674,12 +685,14 @@ async def run(seasons, teams, output, skip_existing=True,
                     has_new_schema = (
                         'hs_class_year' in head.columns
                         and 'hs_composite_rating' in head.columns
-                        # draft_year should NO LONGER be in the schema
+                        # draft_year should NOT be in schema (we removed it)
                         and 'draft_year' not in head.columns
                     )
                     sample = pd.read_csv(
                         ckpt,
-                        usecols=lambda c: c in ('profile_url', 'profile_scraped', 'height'),
+                        usecols=lambda c: c in ('profile_url', 'profile_scraped',
+                                                'height', 'hs_composite_rating',
+                                                'hs_section_kind'),
                         dtype=str,
                     ).fillna('')
                     bad_url_share = (
@@ -696,9 +709,22 @@ async def run(seasons, teams, output, skip_existing=True,
                         .str.contains(r'May|Jun|Jul|Aug', regex=True, na=False).any()
                         if 'height' in sample.columns else False
                     )
+                    # Detect skeleton-DOM poisoning from the prior run: many rows
+                    # had hs_section_kind set but hs_composite_rating empty. If
+                    # the ratio of (section_kind set & rating empty) is too high,
+                    # the checkpoint is junk.
+                    skeleton_poisoned = False
+                    if ('hs_section_kind' in sample.columns
+                            and 'hs_composite_rating' in sample.columns):
+                        kind_set = sample['hs_section_kind'].str.strip().ne('')
+                        rating_empty = sample['hs_composite_rating'].str.strip().eq('')
+                        if kind_set.sum() > 5:  # need enough sample
+                            skeleton_share = (kind_set & rating_empty).sum() / max(kind_set.sum(), 1)
+                            skeleton_poisoned = skeleton_share > 0.5
                     poisoned = (bad_url_share > 0.1
                                 or fail_share > 0.5
-                                or height_corrupt)
+                                or height_corrupt
+                                or skeleton_poisoned)
                 except Exception:
                     has_new_schema = False
                     poisoned = False
