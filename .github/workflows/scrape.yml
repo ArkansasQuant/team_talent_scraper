@@ -53,7 +53,7 @@ jobs:
     timeout-minutes: 350
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 2
       matrix:
         season: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
