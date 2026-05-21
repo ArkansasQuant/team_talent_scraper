@@ -13,20 +13,30 @@ Two rating columns:
   - hs_scout_rating: the 247Sports whole-number rating (e.g. 95), captured
     from the profile's "247Sports" rankings section.
 
+Transfer fields are populated ONLY when a "247Sports Transfer Rankings"
+section exists on the profile (i.e. the player actually transferred). There
+is no transfer_destination column — the roster `team` column already records
+which team the player was on each season. transfer_origin_team is best-effort
+from the profile's team-info-section.
+
+CRITICAL: We do NOT navigate away from the /college-{team_id}/ view. That
+view contains BOTH the "As a Transfer" and "As a Prospect" sections (verified
+via live DOM). Earlier versions clicked "View recruiting profile" / "(HS)"
+which moved to the HS-only view, destroying transfer capture AND tripling
+per-profile load time (causing 5h50m job timeouts).
+
 Design principles:
   - Profile fetch ported from working transfer-portal scraper:
       wait_until="commit", wait_for_selector(".name, h1.name", 15s)
-  - Profile navigation ported from working HS recruiting scraper:
-      navigate_to_recruiting_profile() → clicks "View recruiting profile"
-      navigate_to_hs_profile() → clicks "(HS)" link on JUCO/NCAA profiles
-  - Section parser split by section kind based on observed DOM:
-      Transfer section <li>s use positionKey= in href (e.g. TransferPortalTop/?positionKey=25)
-      Prospect section <li>s use Position= in href (e.g. recruitrankings/?Position=CB)
-      State rows have State= in href (skip)
-      National rank rows have InstitutionGroup=HighSchool with no Position= or State=
-  - Concurrency dropped to 3 (was 6) to avoid 247 rate limiting
+  - Section parser split by kind based on observed DOM:
+      Transfer <li>s use positionKey= in href; prospect <li>s use Position=
+      State rows have State= (skip); national rank rows have
+      InstitutionGroup=HighSchool with no Position= or State=
+  - Concurrency 4; no navigation hops → ~2h/season
   - GLOBAL profile cache keyed by 247_id only
   - Cache flushed after each team-season for mid-run resilience
+  - Roster-page failures use backoff + higher abort threshold so transient
+    247 blocks don't kill a whole season job
   - Post-run verification
 
 Usage:
@@ -64,24 +74,24 @@ USER_AGENTS = [
 DELAY_MIN = 1.0
 DELAY_MAX = 3.0
 NAV_TIMEOUT_MS = 30000
-PROFILE_NAV_TIMEOUT_MS = 60000        # match transfer scraper
-PROFILE_SELECTOR_TIMEOUT_MS = 15000   # match transfer scraper (was 5000)
-PROFILE_POST_NAV_WAIT_MS = 1000
-MAX_CONSECUTIVE_FAILURES = 8
+PROFILE_NAV_TIMEOUT_MS = 60000
+PROFILE_SELECTOR_TIMEOUT_MS = 15000
+PROFILE_POST_NAV_WAIT_MS = 800
+MAX_CONSECUTIVE_FAILURES = 15        # was 8 — survive transient 247 blocks
+ROSTER_BLOCK_BACKOFF_S = 30          # cool-off after a roster-page failure
 MAX_RETRIES_PER_PAGE = 3
 MAX_PROFILE_RETRIES = 2
-DEFAULT_PROFILE_CONCURRENCY = 3       # was 6
+DEFAULT_PROFILE_CONCURRENCY = 4      # no navigation hops → can run at 4
 PROFILE_DELAY_MIN = 0.3
 PROFILE_DELAY_MAX = 1.0
 
-# Schema 10 changes:
-#   - _parse_one_section split into _parse_transfer_section and _parse_prospect_section
-#     based on observed DOM: transfer uses positionKey= in href, prospect uses Position=.
-#   - National rank in prospect sections detected via href containing
-#     InstitutionGroup=HighSchool *without* Position= or State= (handles
-#     players without a NATL label row).
-#   - Position label preserved even when its rank value is N/A.
-PROFILE_CACHE_SCHEMA = 10
+# Schema 11 changes:
+#   - Profile navigation hops REMOVED. We parse the /college-{id}/ view
+#     directly, which contains both transfer and prospect sections.
+#   - transfer_destination_team column REMOVED entirely.
+#   - transfer_* fields populated ONLY when a transfer section exists.
+#   - transfer_origin_team captured best-effort from team-info-section.
+PROFILE_CACHE_SCHEMA = 11
 
 CHECKPOINT_DIR = Path("checkpoints")
 PROFILE_CACHE_FILE = CHECKPOINT_DIR / "profiles_cache.json"
@@ -90,7 +100,6 @@ PLAYER_URL_RE = re.compile(r'/player/([^/]*?)-(\d+)/?$')
 
 TRANSFER_FIELDS = [
     'transfer_origin_team',
-    'transfer_destination_team',
     'transfer_rating',
     'transfer_overall_rank',
     'transfer_position_rank',
@@ -120,7 +129,6 @@ ALL_OUTPUT_COLS = [
 
 
 def _is_na(s):
-    """True if a parsed value should be treated as missing for numeric fields."""
     if s is None:
         return True
     s = str(s).strip().upper()
@@ -128,7 +136,6 @@ def _is_na(s):
 
 
 def _parse_rank(text):
-    """Extract a numeric rank from text like '#123' or '123' or '1,234'."""
     if not text:
         return ''
     m = re.search(r'#?\s*([\d,]+)', text)
@@ -139,9 +146,8 @@ def _parse_rank(text):
 
 # ---------- Roster page extraction ----------
 def parse_roster_html(html, team, season):
-    """Extract roster rows from a team roster page. Captures the decimal
-    composite rating from the roster table directly into hs_composite_rating.
-    """
+    """Extract roster rows. Captures decimal composite rating from the roster
+    table directly into hs_composite_rating."""
     soup = BeautifulSoup(html, 'lxml')
     rows = []
 
@@ -235,72 +241,23 @@ def parse_roster_html(html, team, season):
     return rows
 
 
-# ---------- Profile navigation helpers (ported from HS recruiting scraper) ----------
-async def _navigate_to_recruiting_profile(page):
-    """Click 'View recruiting profile' if present — required when 247 lands
-    us on a player's college/NFL view instead of their recruiting view."""
-    try:
-        recruiting_link = page.locator(
-            'a:has-text("View recruiting profile"), a:has-text("Recruiting Profile")'
-        )
-        if await recruiting_link.count() > 0:
-            await recruiting_link.first.click()
-            await page.wait_for_load_state('domcontentloaded', timeout=30000)
-            await page.wait_for_timeout(PROFILE_POST_NAV_WAIT_MS)
-            return True
-    except Exception:
-        pass
-    return False
-
-
-async def _navigate_to_hs_profile(page):
-    """If on a JUCO/NCAA profile, navigate to the (HS) profile."""
-    try:
-        hs_href = await page.evaluate("""
-            () => {
-                const links = [...document.querySelectorAll('a')];
-                const hs = links.find(a => a.textContent.includes('(HS)'));
-                return hs ? hs.href : null;
-            }
-        """)
-        if hs_href:
-            await page.goto(hs_href, wait_until='domcontentloaded', timeout=30000)
-            await page.wait_for_timeout(PROFILE_POST_NAV_WAIT_MS)
-            return True
-    except Exception:
-        pass
-    return False
-
-
 # ---------- Section parsing ----------
 def _parse_section_common(section, is_juco):
-    """Parse rating, year, and stars from a rankings section.
-
-    Selectors (verified against live DOM screenshots):
-      Rating container: .rank-block (may contain a .rank-year span for year)
-      Stars: span.icon-starsolid.yellow (lightgrey = unfilled, skipped)
-    """
-    out = {
-        'rating': '', 'year': None, 'stars': '',
-    }
-
+    out = {'rating': '', 'year': None, 'stars': ''}
     rating_block = (section.select_one('.rank-block')
                     or section.select_one('.score')
                     or section.select_one('.rating'))
     if rating_block:
-        # Extract year first from .rank-year span if present
         year_tag = rating_block.select_one('.rank-year')
         if year_tag:
             m_year = re.search(r'\((\d{4})\)', year_tag.get_text(' ', strip=True))
             if m_year:
                 out['year'] = int(m_year.group(1))
-        # Get full text and parse leading number for the rating
         rating_text = rating_block.get_text(' ', strip=True)
         if not _is_na(rating_text):
             m_rating = re.match(r'^\s*(\d+(?:\.\d+)?)', rating_text)
             if m_rating:
                 out['rating'] = m_rating.group(1)
-        # Fallback for year embedded in main text
         if out['year'] is None:
             m_year2 = re.search(r'\((\d{4})\)', rating_text)
             if m_year2:
@@ -309,39 +266,18 @@ def _parse_section_common(section, is_juco):
     if is_juco:
         out['stars'] = 'JUCO'
     else:
-        stars = section.select(
-            'span.icon-starsolid.yellow, i.icon-starsolid.yellow'
-        )
+        stars = section.select('span.icon-starsolid.yellow, i.icon-starsolid.yellow')
         if stars:
             out['stars'] = str(min(len(stars), 5))
     return out
 
 
 def _parse_transfer_section(section):
-    """Parse a transfer rankings section. DOM shape (verified live 2026-05-19):
-
-      <section class="rankings-section">
-        <h3 class="title">247Sports Transfer Rankings</h3>
-        <div class="ranking">
-          <div class="stars-block">…</div>
-          <div class="rank-block">85 <span class="rank-year">(2021)</span></div>
-        </div>
-        <ul class="ranks-list">
-          <li><b>OVR</b><a href=".../TransferPortalTop/"><strong>88</strong></a></li>
-          <li><b>S</b><a href=".../TransferPortalTop/?positionKey=25"><strong>13</strong></a></li>
-        </ul>
-      </section>
-
-    Identification rules for transfer <li>:
-      - Label 'OVR' → overall_rank
-      - href contains 'positionKey=' → position_rank (label is position code)
-    """
+    """Transfer section: position rank row uses positionKey= in href."""
     out = {'kind': 'Transfer'}
     out.update(_parse_section_common(section, is_juco=False))
-    out.update({
-        'overall_rank': '', 'national_rank': '',
-        'position_rank': '', 'position': '',
-    })
+    out.update({'overall_rank': '', 'national_rank': '',
+                'position_rank': '', 'position': ''})
 
     ranks_list = section.select_one('ul.ranks-list')
     li_iter = ranks_list.select('li') if ranks_list else section.select('li')
@@ -366,7 +302,6 @@ def _parse_transfer_section(section):
                 if not value_is_na:
                     out['position_rank'] = _parse_rank(value)
         elif not out['position']:
-            # Defensive fallback for non-OVR rows without positionKey=
             out['position'] = label
             if not value_is_na:
                 out['position_rank'] = _parse_rank(value)
@@ -374,37 +309,12 @@ def _parse_transfer_section(section):
 
 
 def _parse_prospect_section(section, is_juco):
-    """Parse a 247Sports / Composite / JUCO prospect section. DOM shape
-    (verified live 2026-05-19):
-
-      <section class="rankings-section">
-        <h3 class="title">247Sports</h3>
-        <div class="ranking">
-          <div class="stars-block">…</div>
-          <div class="rank-block">80</div>
-        </div>
-        <ul class="ranks-list">
-          <li><b>CB</b><a href=".../?InstitutionGroup=HighSchool&Position=CB"><strong>192</strong></a></li>
-          <li><b>TX</b><a href=".../?InstitutionGroup=HighSchool&State=TX"><strong>263</strong></a></li>
-        </ul>
-      </section>
-
-    Some players additionally have a national rank row (no Position=, no State=).
-
-    Identification rules for prospect <li>:
-      - href contains 'State=' → state rank (skip)
-      - href contains 'Position=' → position_rank (label is position code)
-      - href contains 'InstitutionGroup=HighSchool' without Position= or
-        State= → national_rank
-      - Label 'NATL' / 'NATIONAL' (older markup fallback) → national_rank
-      - Label 'OVR' (rare for prospect) → overall_rank
-    """
-    out = {'kind': 'JUCO' if is_juco else '247Sports'}  # caller may overwrite
+    """Prospect section: position rank uses Position=, state rows use State=
+    (skip), national rank uses InstitutionGroup=HighSchool with no Position=."""
+    out = {'kind': 'JUCO' if is_juco else '247Sports'}
     out.update(_parse_section_common(section, is_juco=is_juco))
-    out.update({
-        'overall_rank': '', 'national_rank': '',
-        'position_rank': '', 'position': '',
-    })
+    out.update({'overall_rank': '', 'national_rank': '',
+                'position_rank': '', 'position': ''})
 
     ranks_list = section.select_one('ul.ranks-list')
     li_iter = ranks_list.select('li') if ranks_list else section.select('li')
@@ -420,26 +330,18 @@ def _parse_prospect_section(section, is_juco):
         link = li.find('a')
         href = (link.get('href', '') if link else '')
 
-        # State row — always skip
         if 'State=' in href or 'state=' in href:
             continue
-
-        # Position rank: href has Position= (CB, WR, etc.)
         if 'Position=' in href:
             if not out['position']:
                 out['position'] = label
                 if not value_is_na:
                     out['position_rank'] = _parse_rank(value)
             continue
-
-        # National rank: href has InstitutionGroup=HighSchool with no Position=
-        # (or no State= since we already skipped those above)
         if 'InstitutionGroup=HighSchool' in href:
             if not value_is_na:
                 out['national_rank'] = _parse_rank(value)
             continue
-
-        # Label fallbacks for older markups / variants
         if 'OVR' in label or 'OVERALL' in label:
             if not value_is_na:
                 out['overall_rank'] = _parse_rank(value)
@@ -447,7 +349,6 @@ def _parse_prospect_section(section, is_juco):
             if not value_is_na:
                 out['national_rank'] = _parse_rank(value)
         elif not out['position']:
-            # Last-resort position label capture (preserves label even if value is N/A)
             out['position'] = label
             if not value_is_na:
                 out['position_rank'] = _parse_rank(value)
@@ -468,35 +369,21 @@ def _prospect_event_is_real(ev):
 
 
 def parse_player_profile(html):
-    """Pull origin/destination teams, ALL transfer events, and a prospect event.
-
-    Section title variants:
-      "247Sports Transfer Rankings"  → transfer
-      "247Sports"                    → HS recruiting (whole-number scout rating)
-      "247Sports Composite®"         → HS composite (decimal rating)
-      "JUCO" anywhere in title       → JUCO recruiting
-
-    Section selector broadened to match HS recruiting scraper:
-      'section.rankings, section.rankings-section, div.ranking-section'
-    """
+    """Parse origin team, ALL transfer events, and a prospect event from a
+    profile. We parse the /college-{id}/ view directly (no navigation), which
+    holds both transfer and prospect sections."""
     soup = BeautifulSoup(html, 'lxml')
     result = {
         'origin_team': '',
-        'destination_team': '',
         'transfer_events': [],
         'prospect_event': None,
         'section_titles': [],
     }
 
+    # Origin team — best effort. Primary: team-info-section header h2.
     team_header = soup.select_one('.team-info-section header h2')
     if team_header:
         result['origin_team'] = team_header.get_text(strip=True)
-
-    commit_banner = soup.select_one('.commit-banner span')
-    if commit_banner:
-        txt = commit_banner.get_text(strip=True)
-        if txt and txt.lower() != 'commit':
-            result['destination_team'] = txt
 
     juco_event = None
     primary_247_event = None
@@ -552,7 +439,6 @@ def parse_player_profile(html):
 
 
 def pick_transfer_event(profile, season):
-    """Choose the transfer event for this roster season."""
     events = profile.get('transfer_events') or []
     if not events:
         return None
@@ -604,7 +490,6 @@ def flush_profile_cache(cache):
 
 # ---------- Profile fetcher ----------
 def _ensure_college_suffix(url, team_canonical):
-    """Append /college-{team_id}/ if missing."""
     if not url:
         return url
     if '/college-' in url:
@@ -622,16 +507,8 @@ def _ensure_college_suffix(url, team_canonical):
 async def fetch_one_profile(context, sem, url, player_id):
     """Fetch & parse a single player profile.
 
-    Fetch pattern ported from working transfer-portal scraper:
-      - wait_until="commit"  (let page render naturally)
-      - wait_for_selector(".name, h1.name", timeout=15000)
-
-    Navigation flow:
-      1. goto(url) — initial landing
-      2. navigate_to_recruiting_profile() — click "View recruiting profile" if shown
-      3. navigate_to_hs_profile() — click "(HS)" if on JUCO/NCAA variant
-      4. wait_for(.name) — confirm content rendered
-      5. content() + parse
+    NO navigation hops — we parse the /college-{id}/ view directly, which
+    contains both the transfer and prospect sections.
     """
     async with sem:
         for attempt in range(MAX_PROFILE_RETRIES):
@@ -648,10 +525,6 @@ async def fetch_one_profile(context, sem, url, player_id):
                 await page.goto(url, timeout=PROFILE_NAV_TIMEOUT_MS,
                                 wait_until='commit')
                 await page.wait_for_timeout(PROFILE_POST_NAV_WAIT_MS)
-
-                await _navigate_to_recruiting_profile(page)
-                await _navigate_to_hs_profile(page)
-
                 try:
                     await page.wait_for_selector(
                         '.name, h1.name',
@@ -659,7 +532,6 @@ async def fetch_one_profile(context, sem, url, player_id):
                     )
                 except PlaywrightTimeoutError:
                     pass
-
                 html = await page.content()
                 await page.close()
                 if len(html) < 2000:
@@ -678,21 +550,18 @@ async def fetch_one_profile(context, sem, url, player_id):
                 else:
                     print(f"    profile FAIL ({player_id}): {type(e).__name__}: {e}")
                     return {
-                        'origin_team': '', 'destination_team': '',
-                        'transfer_events': [], 'prospect_event': None,
-                        'section_titles': [],
+                        'origin_team': '', 'transfer_events': [],
+                        'prospect_event': None, 'section_titles': [],
                         'fetch_status': 'failed', 'fetched_url': url,
                     }
         return {
-            'origin_team': '', 'destination_team': '',
-            'transfer_events': [], 'prospect_event': None,
-            'section_titles': [],
+            'origin_team': '', 'transfer_events': [],
+            'prospect_event': None, 'section_titles': [],
             'fetch_status': 'failed', 'fetched_url': url,
         }
 
 
 def _apply_juco_suffix(value, kind):
-    """' (JUCO)' suffix only on real (non-NA, non-empty) values."""
     if not value or _is_na(value):
         return value
     if kind == 'JUCO' and '(JUCO)' not in str(value):
@@ -701,11 +570,8 @@ def _apply_juco_suffix(value, kind):
 
 
 def apply_profile_to_row(row, profile, season):
-    """Write HS and transfer fields from profile into the row.
-
-    hs_composite_rating is pre-populated from the roster table — we do NOT
-    overwrite it here. The profile-parsed value goes to hs_scout_rating.
-    """
+    """Write HS and transfer fields. hs_composite_rating stays from roster
+    table. transfer_* populated ONLY when a transfer event exists."""
     if profile.get('fetch_status') == 'failed':
         row['profile_scraped'] = 'failed'
         return
@@ -722,14 +588,12 @@ def apply_profile_to_row(row, profile, season):
         row['hs_national_rank'] = _apply_juco_suffix(pe.get('national_rank', '') or '', kind)
         row['hs_position_rank'] = _apply_juco_suffix(pe.get('position_rank', '') or '', kind)
 
-    row['transfer_origin_team'] = profile.get('origin_team', '') or ''
-    row['transfer_destination_team'] = profile.get('destination_team', '') or ''
-
     event = pick_transfer_event(profile, season)
     if event is None:
         row['profile_scraped'] = 'ok_no_transfer'
         return
 
+    # A transfer event exists → this player transferred. Populate transfer_*.
     row['profile_scraped'] = 'ok'
     row['transfer_rating']         = event.get('rating', '') or ''
     row['transfer_overall_rank']   = event.get('overall_rank', '') or ''
@@ -738,9 +602,17 @@ def apply_profile_to_row(row, profile, season):
     row['transfer_class_year']     = str(event.get('year', '') or '')
     row['transfer_stars']          = event.get('stars', '') or ''
 
+    # Origin team — best effort from profile, but only if it differs from the
+    # current roster team (origin should not equal where they are now).
+    origin = profile.get('origin_team', '') or ''
+    current_team = row.get('team', '') or ''
+    if origin and origin.strip().lower() != current_team.strip().lower():
+        row['transfer_origin_team'] = origin
+    else:
+        row['transfer_origin_team'] = ''
+
 
 async def enrich_with_profiles(rows, context, profile_cache, concurrency, season):
-    """Fetch missing profiles and apply them to rows."""
     needed = {}
     for r in rows:
         pid = r.get('247_id') or ''
@@ -779,7 +651,6 @@ async def enrich_with_profiles(rows, context, profile_cache, concurrency, season
 
 # ---------- Roster page scrape ----------
 async def scrape_team_season(page, team, season, verbose=False):
-    """Scrape one (team, season) page."""
     url = team_url(team, season)
     try:
         await page.goto(url, wait_until='domcontentloaded', timeout=NAV_TIMEOUT_MS)
@@ -845,14 +716,15 @@ async def run(seasons, teams, output, skip_existing=True,
                         'hs_class_year' in head.columns
                         and 'hs_composite_rating' in head.columns
                         and 'hs_scout_rating' in head.columns
+                        and 'transfer_origin_team' in head.columns
+                        and 'transfer_destination_team' not in head.columns
                         and 'draft_year' not in head.columns
                     )
                     sample = pd.read_csv(
                         ckpt,
                         usecols=lambda c: c in ('profile_url', 'profile_scraped',
-                                                'height', 'hs_composite_rating',
-                                                'hs_section_kind', 'hs_scout_rating',
-                                                'transfer_origin_team'),
+                                                'height', 'hs_section_kind',
+                                                'hs_scout_rating'),
                         dtype=str,
                     ).fillna('')
                     bad_url_share = (
@@ -869,36 +741,24 @@ async def run(seasons, teams, output, skip_existing=True,
                         .str.contains(r'May|Jun|Jul|Aug', regex=True, na=False).any()
                         if 'height' in sample.columns else False
                     )
-                    # Detect last-run skeleton poisoning: kind set but neither
-                    # scout rating nor origin team populated for most rows.
-                    skeleton_poisoned = False
-                    if ('hs_section_kind' in sample.columns
-                            and 'hs_scout_rating' in sample.columns
-                            and 'transfer_origin_team' in sample.columns):
-                        kind_set = sample['hs_section_kind'].str.strip().ne('')
-                        scout_empty = sample['hs_scout_rating'].str.strip().eq('')
-                        origin_empty = sample['transfer_origin_team'].str.strip().eq('')
-                        if kind_set.sum() > 5:
-                            skeleton_share = (kind_set & scout_empty & origin_empty).sum() / max(kind_set.sum(), 1)
-                            skeleton_poisoned = skeleton_share > 0.7
+                    # 0-row checkpoint that was a roster failure → redo
+                    empty_failed = (len(sample) == 0)
                     poisoned = (bad_url_share > 0.1
                                 or fail_share > 0.5
                                 or height_corrupt
-                                or skeleton_poisoned)
+                                or empty_failed)
                 except Exception:
                     has_new_schema = False
                     poisoned = False
                 if poisoned:
-                    print(f"[{i+1}/{len(tasks)}] REDO {team} {season} "
-                          f"(checkpoint poisoned)")
+                    print(f"[{i+1}/{len(tasks)}] REDO {team} {season} (checkpoint poisoned)")
                 elif has_new_schema or skip_profiles:
                     skipped += 1
                     if i % 20 == 0:
                         print(f"[{i+1}/{len(tasks)}] SKIP {team} {season} (cached)")
                     continue
                 else:
-                    print(f"[{i+1}/{len(tasks)}] BACKFILL {team} {season} "
-                          f"(checkpoint exists but schema mismatch)")
+                    print(f"[{i+1}/{len(tasks)}] BACKFILL {team} {season} (schema mismatch)")
 
             if i > 0 and i % 30 == 0:
                 await context.close()
@@ -924,6 +784,19 @@ async def run(seasons, teams, output, skip_existing=True,
                 status = 'FAIL'
                 with open(ckpt, 'w', newline='') as f:
                     f.write('# SCRAPE FAILED — delete this file to retry\n')
+                # Cool-off + fresh context: transient 247 block recovery
+                print(f"  roster block — cooling off {ROSTER_BLOCK_BACKOFF_S}s "
+                      f"& rotating context ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
+                await asyncio.sleep(ROSTER_BLOCK_BACKOFF_S)
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+                context = await browser.new_context(
+                    user_agent=random.choice(USER_AGENTS),
+                    viewport={'width': 1280, 'height': 900},
+                )
+                page = await context.new_page()
             else:
                 consecutive_failures = 0
                 if rows:
@@ -992,7 +865,6 @@ async def run(seasons, teams, output, skip_existing=True,
             except Exception as e:
                 print(f"  WARN: failed to write xlsx ({e}); CSV is canonical.")
 
-        # Post-run validation
         print(f"\n=== Post-run validation ===")
         print(f"Distinct 247 IDs:    {full['247_id'].nunique():,}")
         print(f"Rows with 247 ID:    {full['247_id'].notna().sum():,}  "
@@ -1001,6 +873,8 @@ async def run(seasons, teams, output, skip_existing=True,
             for f in (HS_FIELDS + TRANSFER_FIELDS):
                 filled = full[f].astype(str).str.strip().replace('nan', '').ne('').sum()
                 print(f"  {f:32s} filled: {filled:6,}  ({filled/len(full):.1%})")
+            transfers = (full['profile_scraped'] == 'ok').sum()
+            print(f"\nRows flagged as transfers (profile_scraped='ok'): {transfers:,}")
         print(f"\nRows per season:")
         print(full.groupby('season').size().to_string())
         print(f"\nTeams with <40 or >200 roster rows (suspicious):")
