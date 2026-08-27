@@ -748,7 +748,8 @@ async def enrich_with_profiles(rows, context, profile_cache, concurrency, season
 _debug_dumps = 0
 
 
-async def dump_debug(page, team, season, requested_url, reason, html=None):
+async def dump_debug(page, team, season, requested_url, reason, html=None,
+                     response=None):
     """Write the evidence needed to fix a zero-row failure without guessing:
     final URL after redirects, page title, a selector census, the full HTML and
     a screenshot. Capped so a systemic failure doesn't produce a huge artifact."""
@@ -784,6 +785,28 @@ async def dump_debug(page, team, season, requested_url, reason, html=None):
     except Exception as e:
         print(f"  WARN: could not write debug screenshot: {e}")
 
+    status = None
+    hdr_note = ''
+    try:
+        if response is not None:
+            status = response.status
+            h = response.headers or {}
+            hdr_note = '  '.join(
+                f"{k}={h[k]}" for k in ('server', 'cf-mitigated', 'cf-ray',
+                                        'x-served-by', 'content-type',
+                                        'retry-after')
+                if k in h)
+    except Exception:
+        pass
+
+    body_preview = ''
+    try:
+        body_preview = await page.evaluate(
+            "() => (document.body ? document.body.innerText : '')"
+            ".replace(/\\s+/g, ' ').trim().slice(0, 300)")
+    except Exception:
+        pass
+
     census = {}
     for sel in ('table', 'table tr', 'a[href*="/player/"]', 'li',
                 '[class*="roster" i]', '[class*="player" i]'):
@@ -797,6 +820,8 @@ async def dump_debug(page, team, season, requested_url, reason, html=None):
         'requested_url': requested_url, 'final_url': final_url,
         'redirected': bool(final_url and final_url.rstrip('/') != requested_url.rstrip('/')),
         'page_title': title, 'html_bytes': len(html or ''),
+        'http_status': status, 'response_headers': hdr_note,
+        'body_text_preview': body_preview,
         'selector_counts': census,
         'captured_at': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
     }
@@ -809,6 +834,14 @@ async def dump_debug(page, team, season, requested_url, reason, html=None):
     print(f"  DEBUG → debug/{stem}.[html|png|json]  final_url={final_url}  "
           f"tables={n_tables}  player_links={n_players}")
 
+    # Everything below is printed to STDOUT as well as the artifact, so the
+    # failure can be diagnosed from the Actions log alone (e.g. on a phone).
+    print(f"    http_status={status}  bytes={len(html or ''):,}  title={title!r}")
+    if hdr_note:
+        print(f"    response_headers: {hdr_note}")
+    if body_preview:
+        print(f"    body_text[0:300]: {body_preview}")
+
 
 async def scrape_team_season(page, team, season, verbose=True, allow_empty=False):
     """Returns (rows, reason). rows is None on failure, [] only when the page
@@ -819,8 +852,10 @@ async def scrape_team_season(page, team, season, verbose=True, allow_empty=False
     parse is now a failure with a debug dump attached."""
     last_reason = 'unknown'
     for cand_i, url in enumerate(team_url_candidates(team, season)):
+        resp = None
         try:
-            await page.goto(url, wait_until='domcontentloaded', timeout=NAV_TIMEOUT_MS)
+            resp = await page.goto(url, wait_until='domcontentloaded',
+                                   timeout=NAV_TIMEOUT_MS)
         except PlaywrightTimeoutError:
             last_reason = 'nav_timeout'
             if verbose:
@@ -839,7 +874,8 @@ async def scrape_team_season(page, team, season, verbose=True, allow_empty=False
             last_reason = 'no_roster_markup'
             if verbose:
                 print(f"  NO ROSTER MARKUP for {team} {season} ({url})")
-            await dump_debug(page, team, season, url, f'{last_reason}_c{cand_i}')
+            await dump_debug(page, team, season, url, f'{last_reason}_c{cand_i}',
+                             response=resp)
             continue
 
         # Let a lazily-rendered roster settle before reading the DOM.
@@ -861,7 +897,8 @@ async def scrape_team_season(page, team, season, verbose=True, allow_empty=False
             return rows, 'ok'
 
         last_reason = 'parsed_zero_rows'
-        await dump_debug(page, team, season, url, f'{last_reason}_c{cand_i}', html=html)
+        await dump_debug(page, team, season, url, f'{last_reason}_c{cand_i}',
+                         html=html, response=resp)
 
     if allow_empty and last_reason == 'parsed_zero_rows':
         return [], 'empty_allowed'
