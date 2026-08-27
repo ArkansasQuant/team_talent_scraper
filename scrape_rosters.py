@@ -868,8 +868,10 @@ async def dump_debug(page, team, season, requested_url, reason, html=None):
         (DEBUG_DIR / f"{stem}.json").write_text(json.dumps(info, indent=2), encoding='utf-8')
     except Exception:
         pass
+    n_tables = census.get('table')
+    n_players = census.get('a[href*="/player/"]')
     print(f"  DEBUG → debug/{stem}.[html|png|json]  final_url={final_url}  "
-          f"tables={census.get('table')}  player_links={census.get('a[href*=\"/player/\"]')}")
+          f"tables={n_tables}  player_links={n_players}")
 
 
 async def scrape_team_season(page, team, season, verbose=True, allow_empty=False):
