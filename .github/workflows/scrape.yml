@@ -23,6 +23,10 @@ on:
         description: 'Force re-scrape (ignore existing checkpoints)'
         required: false
         default: 'false'
+      allow_empty:
+        description: 'Treat a rendered-but-playerless roster page as empty instead of a failure'
+        required: false
+        default: 'false'
 
 concurrency:
   group: scrape-rosters-${{ github.event.inputs.seasons }}
@@ -39,7 +43,7 @@ jobs:
         run: |
           INPUT="${{ github.event.inputs.seasons }}"
           if [ "$INPUT" = "all" ]; then
-            SEASONS="2018 2019 2020 2021 2022 2023 2024 2025"
+            SEASONS="2018 2019 2020 2021 2022 2023 2024 2025 2026"
           else
             SEASONS=$(echo "$INPUT" | tr ',' ' ')
           fi
@@ -94,12 +98,15 @@ jobs:
           SKIP_PROFILES:       ${{ github.event.inputs.skip_profiles }}
           PROFILE_CONCURRENCY: ${{ github.event.inputs.profile_concurrency }}
           FORCE:               ${{ github.event.inputs.force }}
+          ALLOW_EMPTY:         ${{ github.event.inputs.allow_empty }}
         run: |
+          set -o pipefail
           ARGS="--seasons $SEASON --output roster_${SEASON}.csv"
           ARGS="$ARGS --profile-concurrency ${PROFILE_CONCURRENCY:-6}"
           if [ -n "$TEAMS" ]; then ARGS="$ARGS --teams $TEAMS"; fi
           if [ "$SKIP_PROFILES" = "true" ]; then ARGS="$ARGS --skip-profiles"; fi
           if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
+          if [ "$ALLOW_EMPTY" = "true" ]; then ARGS="$ARGS --allow-empty"; fi
           echo "Running: python scrape_rosters.py $ARGS"
           python scrape_rosters.py $ARGS 2>&1 | tee scrape_${SEASON}.log
 
@@ -118,11 +125,12 @@ jobs:
           path: |
             roster_${{ matrix.season }}.csv
             scrape_${{ matrix.season }}.log
+            debug/**
           retention-days: 7
 
   combine:
     needs: scrape
-    if: always()
+    if: success()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -147,8 +155,8 @@ jobs:
           import glob, pandas as pd, os, datetime
           files = sorted(glob.glob('per_season/roster_*.csv'))
           if not files:
-              print("No per-season CSVs found — nothing to combine.")
-              raise SystemExit(0)
+              print("FAILING: no per-season CSVs found — the scrape produced nothing.")
+              raise SystemExit(1)
           dfs = []
           for f in files:
               try:
@@ -170,6 +178,13 @@ jobs:
               print(f"\nWrote {xlsx_path}: {len(full):,} rows  "
                     f"({full['season'].nunique()} seasons, "
                     f"{full['team'].nunique()} teams)")
+              print(full.groupby('season').size().to_string())
+              if full.empty:
+                  print("FAILING: combined frame has zero rows.")
+                  raise SystemExit(1)
+          else:
+              print("FAILING: no readable per-season CSVs.")
+              raise SystemExit(1)
           PY
 
       - name: Upload combined roster (single artifact, single sheet xlsx)
@@ -180,4 +195,5 @@ jobs:
           path: |
             roster_full_*.xlsx
             roster_full_*.csv
+          if-no-files-found: error
           retention-days: 90
