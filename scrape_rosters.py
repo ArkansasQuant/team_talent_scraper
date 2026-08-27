@@ -61,7 +61,8 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-from team_urls import TEAM_URLS, team_url, is_fbs_in_year, all_teams
+from team_urls import (TEAM_URLS, team_url, team_url_candidates,
+                       is_fbs_in_year, all_teams)
 
 # ---------- Config ----------
 USER_AGENTS = [
@@ -80,6 +81,19 @@ PROFILE_POST_NAV_WAIT_MS = 800
 MAX_CONSECUTIVE_FAILURES = 15        # was 8 — survive transient 247 blocks
 ROSTER_BLOCK_BACKOFF_S = 30          # cool-off after a roster-page failure
 MAX_RETRIES_PER_PAGE = 3
+
+# --- Roster page readiness -------------------------------------------------
+# The 2026 run failed here: every team hit a 10s wait_for_selector('table')
+# timeout, returned [], and was logged as "OK (0 rows)". We now wait on a
+# roster table OR any player link, allow lazy render to settle, and treat a
+# zero-row parse as a FAILURE rather than an empty roster.
+ROSTER_READY_SELECTOR = 'table, a[href*="/player/"]'
+ROSTER_SELECTOR_TIMEOUT_MS = 20000
+LAZY_SETTLE_MS = 1500
+EARLY_ABORT_AFTER = 5                # abort if the first N tasks all fail
+DEBUG_DIR = Path("debug")
+MAX_DEBUG_DUMPS = 8                  # cap artifact size on a systemic failure
+MIN_LIST_ROWS = 10                   # non-table fallback needs a real group
 MAX_PROFILE_RETRIES = 2
 DEFAULT_PROFILE_CONCURRENCY = 4      # no navigation hops → can run at 4
 PROFILE_DELAY_MIN = 0.3
@@ -145,99 +159,244 @@ def _parse_rank(text):
 
 
 # ---------- Roster page extraction ----------
-def parse_roster_html(html, team, season):
-    """Extract roster rows. Captures decimal composite rating from the roster
-    table directly into hs_composite_rating."""
-    soup = BeautifulSoup(html, 'lxml')
-    rows = []
+PLACEHOLDER_IDS = {'46120272'}
 
-    player_anchors = []
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        m = PLAYER_URL_RE.search(href)
-        if m:
-            slug, pid = m.group(1), m.group(2)
-            is_placeholder = (
-                pid == '46120272'
-                or slug == ''
-                or set(slug) <= {'-'}
-            )
-            name = a.get_text(strip=True)
-            if name:
-                if href.startswith('http://') or href.startswith('https://'):
-                    full_url = href.rstrip('/') + '/'
-                else:
-                    full_url = f"https://247sports.com{href.rstrip('/')}/"
-                player_anchors.append({
-                    'name': name,
-                    '247_id': None if is_placeholder else pid,
-                    'profile_url': None if is_placeholder else full_url,
-                })
+ROW_CONTAINER_TAGS = ('tr', 'li', 'article')
 
-    data_rows = []
+CLASS_YR_TOKENS = {
+    'FR', 'SO', 'JR', 'SR', 'GR', 'RS', 'RFR', 'RSO', 'RJR', 'RSR',
+    'R-FR', 'R-SO', 'R-JR', 'R-SR', 'RS-FR', 'RS-SO', 'RS-JR', 'RS-SR',
+    'HS', 'FY',
+}
+
+HEIGHT_RE = re.compile(r"^\s*(\d)[-'\u2019](\d{1,2})\"?\s*$")
+RATING_RE = re.compile(r'^\s*(0?\.\d{3,4})\s*$')
+WEIGHT_RE = re.compile(r'^\s*(\d{2,3})\s*$')
+JERSEY_RE = re.compile(r'^\s*#?(\d{1,2})\s*$')
+
+
+def _anchor_fields(a, m):
+    """Identity fields for one player anchor. Absolute hrefs are left alone —
+    the old 'https://247sports.comhttps://...' doubling came from prepending
+    the base to an already-absolute href."""
+    slug, pid = m.group(1), m.group(2)
+    is_placeholder = (pid in PLACEHOLDER_IDS or slug == '' or set(slug) <= {'-'})
+    href = a['href']
+    if href.startswith('http://') or href.startswith('https://'):
+        full_url = href.rstrip('/') + '/'
+    else:
+        full_url = f"https://247sports.com{href.rstrip('/')}/"
+    return {
+        'name': a.get_text(strip=True),
+        '247_id': None if is_placeholder else pid,
+        'profile_url': None if is_placeholder else full_url,
+    }
+
+
+def _find_row_anchor(el):
+    """The player anchor INSIDE this row. Scoping the anchor to its own row is
+    what guarantees name/ID alignment — the old global-anchor sliding window
+    could shift every field on the page."""
+    for a in el.find_all('a', href=True):
+        m = PLAYER_URL_RE.search(a['href'])
+        if m and a.get_text(strip=True):
+            return _anchor_fields(a, m)
+    return None
+
+
+def _table_rows(soup):
+    """Classic <table> roster layout. Returns [(row_el, [cell_texts]), ...]."""
     for table in soup.find_all('table'):
         trs = table.find_all('tr')
         if len(trs) < 2:
             continue
-        header_cells = [c.get_text(strip=True).lower() for c in trs[0].find_all(['th', 'td'])]
+        header_cells = [c.get_text(strip=True).lower()
+                        for c in trs[0].find_all(['th', 'td'])]
         header_text = ' '.join(header_cells)
-        if not ('jersey' in header_text or 'pos' in header_text or 'height' in header_text):
+        if not ('jersey' in header_text or 'pos' in header_text
+                or 'height' in header_text):
             continue
+        out = []
         for tr in trs[1:]:
-            tds = [td.get_text(strip=True) for td in tr.find_all(['td', 'th'])]
-            if len(tds) < 6:
+            cells = [td.get_text(strip=True) for td in tr.find_all(['td', 'th'])]
+            if len(cells) < 6:
                 continue
-            data_rows.append(tds)
-        break
+            out.append((tr, cells))
+        if out:
+            return out
+    return []
 
-    if not data_rows:
+
+def _list_rows(soup):
+    """Fallback for a non-<table> roster layout (247 has moved other pages to
+    ul/li). Anchor-first: walk up from each player link to its repeating row
+    container, then keep the largest sibling group."""
+    groups = {}
+    for a in soup.find_all('a', href=True):
+        m = PLAYER_URL_RE.search(a['href'])
+        if not m or not a.get_text(strip=True):
+            continue
+        node, row = a, None
+        for _ in range(6):
+            node = node.parent
+            if node is None:
+                break
+            if node.name in ROW_CONTAINER_TAGS:
+                row = node
+                break
+        if row is None or row.parent is None:
+            continue
+        groups.setdefault(id(row.parent), []).append(row)
+
+    if not groups:
+        return []
+    best = max(groups.values(), key=len)
+    if len(best) < MIN_LIST_ROWS:
         return []
 
-    n = len(data_rows)
-    best_window = None
-    for i in range(len(player_anchors) - n + 1):
-        window = player_anchors[i:i + n]
-        score = sum(1 for a in window if a['247_id'])
-        if best_window is None or score > best_window['score']:
-            best_window = {'anchors': window, 'score': score, 'start': i}
+    out = []
+    seen = set()
+    for row in best:
+        if id(row) in seen:
+            continue
+        seen.add(id(row))
+        cells = [t.strip() for t in row.stripped_strings if t.strip()]
+        out.append((row, cells))
+    return out
 
-    if not best_window or best_window['score'] == 0:
-        anchors = player_anchors[:n] if len(player_anchors) >= n else None
-        if anchors is None:
-            return []
+
+def _fields_positional(cells):
+    """Column order verified against the 2018-2025 table layout."""
+    jersey, pos, height, weight, yr, age, hs, rating = (cells + [''] * 8)[:8]
+    return {'jersey': jersey, 'position': pos, 'height': height,
+            'weight': weight, 'class_yr': yr, 'age': age,
+            'high_school': hs, 'rating': rating}
+
+
+def _fields_by_pattern(cells):
+    """Assign fields by shape, not by index. Used for the non-table fallback,
+    where column order is unknown. Anything that does not match a pattern is
+    left BLANK rather than guessed into the wrong column."""
+    out = {'jersey': '', 'position': '', 'height': '', 'weight': '',
+           'class_yr': '', 'age': '', 'high_school': '', 'rating': ''}
+    for c in cells:
+        t = c.strip()
+        if not t:
+            continue
+        if not out['height'] and HEIGHT_RE.match(t):
+            out['height'] = t
+            continue
+        if not out['rating'] and RATING_RE.match(t):
+            out['rating'] = t
+            continue
+        if not out['class_yr'] and t.upper().replace('.', '') in CLASS_YR_TOKENS:
+            out['class_yr'] = t.upper()
+            continue
+        if not out['weight'] and WEIGHT_RE.match(t) and 140 <= int(t) <= 420:
+            out['weight'] = t
+            continue
+        if not out['jersey'] and JERSEY_RE.match(t):
+            out['jersey'] = JERSEY_RE.match(t).group(1)
+            continue
+        if not out['position'] and 1 <= len(t) <= 3 and t.isalpha() and t.isupper():
+            out['position'] = t
+            continue
+    return out
+
+
+def _normalize_height(height):
+    """Store 5'8\" not 5-8. Bare 5-8 is what Excel turns into '8-May'."""
+    m = re.match(r"^\s*(\d{1,2})-(\d{1,2})\s*$", height or '')
+    if m:
+        return f"{m.group(1)}'{m.group(2)}\""
+    return height or ''
+
+
+def sanity_flags(rows):
+    """Catch the failure that corrupted the April output: a whole team-season
+    where one column collapses to a single repeated value (every player #31/DB).
+    Positional parsing produces exactly this when the table shifts."""
+    flags = []
+    if len(rows) < 20:
+        return flags
+    for f in ('jersey', 'position', 'height', 'weight', 'class_yr'):
+        vals = [str(r.get(f, '') or '').strip() for r in rows]
+        nonblank = [v for v in vals if v]
+        if len(nonblank) < 20:
+            continue
+        top = max(set(nonblank), key=nonblank.count)
+        share = nonblank.count(top) / len(nonblank)
+        if share > 0.6:
+            flags.append(f"{f}={top!r} on {share:.0%} of rows")
+    return flags
+
+
+def parse_roster_html(html, team, season):
+    """Extract roster rows. Table layout first (verified for 2018-2025), then a
+    non-table fallback that captures identity fields with confidence and leaves
+    unmatched columns blank."""
+    soup = BeautifulSoup(html, 'lxml')
+
+    table_rows = _table_rows(soup)
+    if table_rows:
+        row_pairs, mode = table_rows, 'table'
     else:
-        anchors = best_window['anchors']
+        row_pairs, mode = _list_rows(soup), 'list'
+    if not row_pairs:
+        return []
 
-    for anchor, data in zip(anchors, data_rows):
-        data = (data + [''] * 8)[:8]
-        jersey, pos, height, weight, yr, age, hs, rating = data
-        m_h = re.match(r'^\s*(\d{1,2})-(\d{1,2})\s*$', height or '')
-        if m_h:
-            height = f"{m_h.group(1)}'{m_h.group(2)}\""
+    # Global-anchor fallback only for rows with no anchor of their own.
+    global_anchors = []
+    for a in soup.find_all('a', href=True):
+        m = PLAYER_URL_RE.search(a['href'])
+        if m and a.get_text(strip=True):
+            global_anchors.append(_anchor_fields(a, m))
+
+    rows = []
+    unanchored = 0
+    for idx, (row_el, cells) in enumerate(row_pairs):
+        anchor = _find_row_anchor(row_el)
+        if anchor is None:
+            unanchored += 1
+            if idx < len(global_anchors):
+                anchor = global_anchors[idx]
+            else:
+                continue
+
+        f = _fields_positional(cells) if mode == 'table' else _fields_by_pattern(cells)
+
         composite_from_roster = ''
-        if rating:
-            m_rating = re.match(r'^\s*(\d+\.\d+)', rating)
+        if f['rating']:
+            m_rating = re.match(r'^\s*(\d*\.\d+)', f['rating'])
             if m_rating:
                 composite_from_roster = m_rating.group(1)
+
         row = {
             '247_id': anchor['247_id'],
             'player_name': anchor['name'],
             'team': team,
             'season': season,
-            'jersey': jersey,
-            'position': pos,
-            'height': height,
-            'weight': weight,
-            'class_yr': yr,
-            'age': age,
-            'high_school': hs,
+            'jersey': f['jersey'],
+            'position': f['position'],
+            'height': _normalize_height(f['height']),
+            'weight': f['weight'],
+            'class_yr': f['class_yr'],
+            'age': f['age'],
+            'high_school': f['high_school'],
             'profile_url': anchor['profile_url'] or '',
             'scrape_ts': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
         }
-        for f in HS_FIELDS + TRANSFER_FIELDS + STATUS_FIELDS:
-            row[f] = ''
+        for fld in HS_FIELDS + TRANSFER_FIELDS + STATUS_FIELDS:
+            row[fld] = ''
         row['hs_composite_rating'] = composite_from_roster
         rows.append(row)
+
+    if rows and unanchored:
+        print(f"  NOTE: {team} {season} — {unanchored}/{len(row_pairs)} rows had "
+              f"no in-row player link (fell back to page order)")
+    if mode == 'list' and rows:
+        print(f"  NOTE: {team} {season} — parsed via NON-TABLE fallback "
+              f"({len(rows)} rows); check debug dump before trusting columns")
     return rows
 
 
@@ -650,33 +809,131 @@ async def enrich_with_profiles(rows, context, profile_cache, concurrency, season
 
 
 # ---------- Roster page scrape ----------
-async def scrape_team_season(page, team, season, verbose=False):
-    url = team_url(team, season)
+_debug_dumps = 0
+
+
+async def dump_debug(page, team, season, requested_url, reason, html=None):
+    """Write the evidence needed to fix a zero-row failure without guessing:
+    final URL after redirects, page title, a selector census, the full HTML and
+    a screenshot. Capped so a systemic failure doesn't produce a huge artifact."""
+    global _debug_dumps
+    if _debug_dumps >= MAX_DEBUG_DUMPS:
+        return
+    _debug_dumps += 1
+    DEBUG_DIR.mkdir(exist_ok=True)
+    safe = team.replace(' ', '_').replace('/', '_').replace('(', '').replace(')', '')
+    stem = f"{season}_{safe}_{reason}"
+
+    final_url, title = '', ''
     try:
-        await page.goto(url, wait_until='domcontentloaded', timeout=NAV_TIMEOUT_MS)
-    except PlaywrightTimeoutError:
-        if verbose:
-            print(f"  TIMEOUT goto {team} {season}")
-        return None
+        final_url = page.url
+    except Exception:
+        pass
+    try:
+        title = await page.title()
+    except Exception:
+        pass
+
+    if html is None:
+        try:
+            html = await page.content()
+        except Exception:
+            html = ''
+    try:
+        (DEBUG_DIR / f"{stem}.html").write_text(html or '', encoding='utf-8')
     except Exception as e:
-        if verbose:
-            print(f"  ERROR goto {team} {season}: {type(e).__name__}: {e}")
-        return None
-
+        print(f"  WARN: could not write debug html: {e}")
     try:
-        await page.wait_for_selector('table', timeout=10000)
-    except PlaywrightTimeoutError:
-        if verbose:
-            print(f"  NO TABLE for {team} {season}")
-        return []
+        await page.screenshot(path=str(DEBUG_DIR / f"{stem}.png"), full_page=True)
+    except Exception as e:
+        print(f"  WARN: could not write debug screenshot: {e}")
 
-    html = await page.content()
-    return parse_roster_html(html, team, season)
+    census = {}
+    for sel in ('table', 'table tr', 'a[href*="/player/"]', 'li',
+                '[class*="roster" i]', '[class*="player" i]'):
+        try:
+            census[sel] = await page.locator(sel).count()
+        except Exception:
+            census[sel] = -1
+
+    info = {
+        'team': team, 'season': season, 'reason': reason,
+        'requested_url': requested_url, 'final_url': final_url,
+        'redirected': bool(final_url and final_url.rstrip('/') != requested_url.rstrip('/')),
+        'page_title': title, 'html_bytes': len(html or ''),
+        'selector_counts': census,
+        'captured_at': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+    }
+    try:
+        (DEBUG_DIR / f"{stem}.json").write_text(json.dumps(info, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+    print(f"  DEBUG → debug/{stem}.[html|png|json]  final_url={final_url}  "
+          f"tables={census.get('table')}  player_links={census.get('a[href*=\"/player/\"]')}")
+
+
+async def scrape_team_season(page, team, season, verbose=True, allow_empty=False):
+    """Returns (rows, reason). rows is None on failure, [] only when the page
+    genuinely rendered with no players AND allow_empty is set.
+
+    The 2026 break was here: wait_for_selector('table') timed out at 10s and the
+    function returned [], which the caller recorded as 'OK (0 rows)'. A zero-row
+    parse is now a failure with a debug dump attached."""
+    last_reason = 'unknown'
+    for cand_i, url in enumerate(team_url_candidates(team, season)):
+        try:
+            await page.goto(url, wait_until='domcontentloaded', timeout=NAV_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            last_reason = 'nav_timeout'
+            if verbose:
+                print(f"  TIMEOUT goto {team} {season} ({url})")
+            continue
+        except Exception as e:
+            last_reason = f'nav_error_{type(e).__name__}'
+            if verbose:
+                print(f"  ERROR goto {team} {season}: {type(e).__name__}: {e}")
+            continue
+
+        try:
+            await page.wait_for_selector(ROSTER_READY_SELECTOR,
+                                         timeout=ROSTER_SELECTOR_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            last_reason = 'no_roster_markup'
+            if verbose:
+                print(f"  NO ROSTER MARKUP for {team} {season} ({url})")
+            await dump_debug(page, team, season, url, f'{last_reason}_c{cand_i}')
+            continue
+
+        # Let a lazily-rendered roster settle before reading the DOM.
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(LAZY_SETTLE_MS)
+        except Exception:
+            pass
+
+        html = await page.content()
+        rows = parse_roster_html(html, team, season)
+        if rows:
+            if cand_i > 0:
+                print(f"  NOTE: {team} {season} used FALLBACK url #{cand_i} "
+                      f"({url}) — not year-scoped, verify the season is right")
+            flags = sanity_flags(rows)
+            if flags:
+                print(f"  ⚠ SUSPECT COLUMNS {team} {season}: {'; '.join(flags)}")
+            return rows, 'ok'
+
+        last_reason = 'parsed_zero_rows'
+        await dump_debug(page, team, season, url, f'{last_reason}_c{cand_i}', html=html)
+
+    if allow_empty and last_reason == 'parsed_zero_rows':
+        return [], 'empty_allowed'
+    return None, last_reason
 
 
 # ---------- Orchestrator ----------
 async def run(seasons, teams, output, skip_existing=True,
-              skip_profiles=False, profile_concurrency=DEFAULT_PROFILE_CONCURRENCY):
+              skip_profiles=False, profile_concurrency=DEFAULT_PROFILE_CONCURRENCY,
+              allow_empty=False):
     CHECKPOINT_DIR.mkdir(exist_ok=True)
     for s in seasons:
         (CHECKPOINT_DIR / str(s)).mkdir(parents=True, exist_ok=True)
@@ -694,7 +951,10 @@ async def run(seasons, teams, output, skip_existing=True,
           f"{'OFF' if skip_profiles else f'ON (concurrency={profile_concurrency})'}")
     completed = 0
     skipped = 0
+    successes = 0
     consecutive_failures = 0
+    failures = []
+    empties = []
     started_at = time.time()
     new_profiles_this_run = 0
 
@@ -769,19 +1029,23 @@ async def run(seasons, teams, output, skip_existing=True,
                 page = await context.new_page()
 
             rows = None
+            reason = 'unknown'
             for attempt in range(MAX_RETRIES_PER_PAGE):
                 try:
-                    rows = await scrape_team_season(page, team, season, verbose=(attempt > 0))
+                    rows, reason = await scrape_team_season(
+                        page, team, season, verbose=True, allow_empty=allow_empty)
                     if rows is not None:
                         break
                 except Exception as e:
+                    reason = f'exception_{type(e).__name__}'
                     print(f"  retry {attempt+1}: {type(e).__name__}: {e}")
                 await asyncio.sleep(5 + attempt * 3)
 
             status = ''
             if rows is None:
                 consecutive_failures += 1
-                status = 'FAIL'
+                failures.append((team, season, reason))
+                status = f'FAIL ({reason})'
                 with open(ckpt, 'w', newline='') as f:
                     f.write('# SCRAPE FAILED — delete this file to retry\n')
                 # Cool-off + fresh context: transient 247 block recovery
@@ -814,10 +1078,13 @@ async def run(seasons, teams, output, skip_existing=True,
                                   f"{team} {season}: {type(e).__name__}: {e}")
                     pd.DataFrame(rows).reindex(columns=ALL_OUTPUT_COLS).to_csv(
                         ckpt, index=False)
+                    successes += 1
                     status = f'OK ({len(rows)} rows)'
                 else:
+                    # Only reachable with --allow-empty; still not a silent pass.
                     pd.DataFrame(columns=ALL_OUTPUT_COLS).to_csv(ckpt, index=False)
-                    status = 'OK (0 rows)'
+                    empties.append((team, season))
+                    status = 'EMPTY (0 rows — allowed by flag)'
 
             completed += 1
             elapsed = time.time() - started_at
@@ -827,6 +1094,14 @@ async def run(seasons, teams, output, skip_existing=True,
                           f" (+{new_profiles_this_run} new)") if not skip_profiles else ""
             print(f"[{i+1}/{len(tasks)}] {team:24s} {season}  {status}   "
                   f"elapsed={elapsed/60:.1f}m  eta={eta_s/60:.0f}m{cache_note}")
+
+            if len(failures) >= EARLY_ABORT_AFTER and successes == 0:
+                print(f"\n⚠  ABORTING EARLY: first {len(failures)} team-seasons all "
+                      f"failed and none succeeded — this is systemic, not transient.\n"
+                      f"   Reasons: {sorted(set(r for _, _, r in failures))}\n"
+                      f"   Check the `debug` artifact: final_url tells you if 247 "
+                      f"redirected, selector_counts tells you if the markup changed.")
+                break
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 print(f"\n⚠  ABORTING: {MAX_CONSECUTIVE_FAILURES} consecutive failures.")
@@ -887,6 +1162,32 @@ async def run(seasons, teams, output, skip_existing=True,
     else:
         print("No data collected.")
 
+    # ---------- Failure report + exit code ----------
+    attempted = successes + len(failures) + len(empties)
+    if failures:
+        print(f"\n=== FAILED TEAM-SEASONS ({len(failures)}/{attempted}) ===")
+        by_reason = {}
+        for team, season, reason in failures:
+            by_reason.setdefault(reason, []).append(f"{team} {season}")
+        for reason, items in sorted(by_reason.items()):
+            print(f"  {reason}: {len(items)}")
+            for it in items[:10]:
+                print(f"      {it}")
+            if len(items) > 10:
+                print(f"      ... +{len(items) - 10} more")
+        if DEBUG_DIR.exists():
+            print(f"\n  Debug captures written to {DEBUG_DIR}/ "
+                  f"({len(list(DEBUG_DIR.glob('*.json')))} team-seasons). "
+                  f"Read the .json first: final_url + selector_counts.")
+
+    if not dfs:
+        print("\nFAILING: zero rows collected. This is not a successful run.")
+        sys.exit(2)
+    if attempted and len(failures) / attempted > 0.10:
+        print(f"\nFAILING: {len(failures)/attempted:.0%} of team-seasons failed "
+              f"(threshold 10%).")
+        sys.exit(1)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -896,6 +1197,9 @@ def main():
     ap.add_argument('--force', action='store_true',
                     help='Ignore checkpoints, re-scrape all')
     ap.add_argument('--skip-profiles', action='store_true')
+    ap.add_argument('--allow-empty', action='store_true',
+                    help='Treat a rendered-but-playerless roster page as an '
+                         'empty team-season instead of a failure')
     ap.add_argument('--profile-concurrency', type=int,
                     default=DEFAULT_PROFILE_CONCURRENCY)
     args = ap.parse_args()
@@ -911,6 +1215,7 @@ def main():
         skip_existing=not args.force,
         skip_profiles=args.skip_profiles,
         profile_concurrency=args.profile_concurrency,
+        allow_empty=args.allow_empty,
     ))
 
 
