@@ -159,26 +159,23 @@ def _parse_rank(text):
 
 
 # ---------- Roster page extraction ----------
+# VERIFIED DOM (fetched 2026-08-27, Arkansas 2026): 247 renders the roster as
+# TWO sibling tables — a frozen first column whose only header is "Name" and
+# holds the player links, and a second table holding
+# Jersey | POS | Height | Weight | Yr | Age | High School | Rating.
+# They are aligned by ROW ORDER ONLY; the data table contains no anchors.
+# Unrated walk-ons appear in the Name table as plain text with NO link, so any
+# approach that indexes anchors against data rows drifts out of alignment at
+# the first walk-on. That drift is what produced the repeated #31/DB rows in
+# the April export.
 PLACEHOLDER_IDS = {'46120272'}
 
-ROW_CONTAINER_TAGS = ('tr', 'li', 'article')
-
-CLASS_YR_TOKENS = {
-    'FR', 'SO', 'JR', 'SR', 'GR', 'RS', 'RFR', 'RSO', 'RJR', 'RSR',
-    'R-FR', 'R-SO', 'R-JR', 'R-SR', 'RS-FR', 'RS-SO', 'RS-JR', 'RS-SR',
-    'HS', 'FY',
-}
-
-HEIGHT_RE = re.compile(r"^\s*(\d)[-'\u2019](\d{1,2})\"?\s*$")
-RATING_RE = re.compile(r'^\s*(0?\.\d{3,4})\s*$')
-WEIGHT_RE = re.compile(r'^\s*(\d{2,3})\s*$')
-JERSEY_RE = re.compile(r'^\s*#?(\d{1,2})\s*$')
+NAME_HEADER_TOKENS = {'name', 'player'}
+DATA_HEADER_TOKENS = ('jersey', 'height', 'weight')
 
 
 def _anchor_fields(a, m):
-    """Identity fields for one player anchor. Absolute hrefs are left alone —
-    the old 'https://247sports.comhttps://...' doubling came from prepending
-    the base to an already-absolute href."""
+    """Identity fields for one player anchor."""
     slug, pid = m.group(1), m.group(2)
     is_placeholder = (pid in PLACEHOLDER_IDS or slug == '' or set(slug) <= {'-'})
     href = a['href']
@@ -193,115 +190,49 @@ def _anchor_fields(a, m):
     }
 
 
-def _find_row_anchor(el):
-    """The player anchor INSIDE this row. Scoping the anchor to its own row is
-    what guarantees name/ID alignment — the old global-anchor sliding window
-    could shift every field on the page."""
-    for a in el.find_all('a', href=True):
+def _name_cell_to_anchor(td):
+    """A Name-table cell is either a linked player or a bare walk-on name.
+    Both are real roster entries and both must produce a row, or the two
+    tables fall out of alignment."""
+    for a in td.find_all('a', href=True):
         m = PLAYER_URL_RE.search(a['href'])
         if m and a.get_text(strip=True):
             return _anchor_fields(a, m)
-    return None
+    text = td.get_text(strip=True)
+    if not text:
+        return None
+    return {'name': text, '247_id': None, 'profile_url': None}
 
 
-def _table_rows(soup):
-    """Classic <table> roster layout. Returns [(row_el, [cell_texts]), ...]."""
+def _split_roster_tables(soup):
+    """Return (name_cells, data_rows) from the two-table layout, or
+    (None, data_rows) when name and data share one table (older layout)."""
+    name_cells, data_rows = None, None
     for table in soup.find_all('table'):
         trs = table.find_all('tr')
         if len(trs) < 2:
             continue
-        header_cells = [c.get_text(strip=True).lower()
-                        for c in trs[0].find_all(['th', 'td'])]
-        header_text = ' '.join(header_cells)
-        if not ('jersey' in header_text or 'pos' in header_text
-                or 'height' in header_text):
+        hdr = [c.get_text(strip=True).lower() for c in trs[0].find_all(['th', 'td'])]
+        hdr_text = ' '.join(hdr)
+        if (name_cells is None and len(hdr) == 1
+                and hdr[0] in NAME_HEADER_TOKENS):
+            cells = []
+            for tr in trs[1:]:
+                tds = tr.find_all(['td', 'th'])
+                if tds:
+                    cells.append(tds[0])
+            if cells:
+                name_cells = cells
             continue
-        out = []
-        for tr in trs[1:]:
-            cells = [td.get_text(strip=True) for td in tr.find_all(['td', 'th'])]
-            if len(cells) < 6:
-                continue
-            out.append((tr, cells))
-        if out:
-            return out
-    return []
-
-
-def _list_rows(soup):
-    """Fallback for a non-<table> roster layout (247 has moved other pages to
-    ul/li). Anchor-first: walk up from each player link to its repeating row
-    container, then keep the largest sibling group."""
-    groups = {}
-    for a in soup.find_all('a', href=True):
-        m = PLAYER_URL_RE.search(a['href'])
-        if not m or not a.get_text(strip=True):
-            continue
-        node, row = a, None
-        for _ in range(6):
-            node = node.parent
-            if node is None:
-                break
-            if node.name in ROW_CONTAINER_TAGS:
-                row = node
-                break
-        if row is None or row.parent is None:
-            continue
-        groups.setdefault(id(row.parent), []).append(row)
-
-    if not groups:
-        return []
-    best = max(groups.values(), key=len)
-    if len(best) < MIN_LIST_ROWS:
-        return []
-
-    out = []
-    seen = set()
-    for row in best:
-        if id(row) in seen:
-            continue
-        seen.add(id(row))
-        cells = [t.strip() for t in row.stripped_strings if t.strip()]
-        out.append((row, cells))
-    return out
-
-
-def _fields_positional(cells):
-    """Column order verified against the 2018-2025 table layout."""
-    jersey, pos, height, weight, yr, age, hs, rating = (cells + [''] * 8)[:8]
-    return {'jersey': jersey, 'position': pos, 'height': height,
-            'weight': weight, 'class_yr': yr, 'age': age,
-            'high_school': hs, 'rating': rating}
-
-
-def _fields_by_pattern(cells):
-    """Assign fields by shape, not by index. Used for the non-table fallback,
-    where column order is unknown. Anything that does not match a pattern is
-    left BLANK rather than guessed into the wrong column."""
-    out = {'jersey': '', 'position': '', 'height': '', 'weight': '',
-           'class_yr': '', 'age': '', 'high_school': '', 'rating': ''}
-    for c in cells:
-        t = c.strip()
-        if not t:
-            continue
-        if not out['height'] and HEIGHT_RE.match(t):
-            out['height'] = t
-            continue
-        if not out['rating'] and RATING_RE.match(t):
-            out['rating'] = t
-            continue
-        if not out['class_yr'] and t.upper().replace('.', '') in CLASS_YR_TOKENS:
-            out['class_yr'] = t.upper()
-            continue
-        if not out['weight'] and WEIGHT_RE.match(t) and 140 <= int(t) <= 420:
-            out['weight'] = t
-            continue
-        if not out['jersey'] and JERSEY_RE.match(t):
-            out['jersey'] = JERSEY_RE.match(t).group(1)
-            continue
-        if not out['position'] and 1 <= len(t) <= 3 and t.isalpha() and t.isupper():
-            out['position'] = t
-            continue
-    return out
+        if data_rows is None and any(t in hdr_text for t in DATA_HEADER_TOKENS):
+            rows = []
+            for tr in trs[1:]:
+                cells = [td.get_text(strip=True) for td in tr.find_all(['td', 'th'])]
+                if len(cells) >= 6:
+                    rows.append((tr, cells))
+            if rows:
+                data_rows = rows
+    return name_cells, data_rows
 
 
 def _normalize_height(height):
@@ -312,10 +243,26 @@ def _normalize_height(height):
     return height or ''
 
 
+def _split_rating(raw):
+    """The Rating column changed since April: it now carries the WHOLE-NUMBER
+    247Sports rating (85, 94, NA), not the decimal composite (0.8622). Route
+    each form to its own column instead of dropping whole numbers on the floor."""
+    composite, scout = '', ''
+    if not raw or _is_na(raw):
+        return composite, scout
+    m_dec = re.match(r'^\s*(\d*\.\d+)', raw)
+    if m_dec:
+        composite = m_dec.group(1)
+        return composite, scout
+    m_int = re.match(r'^\s*(\d{2,3})\s*$', raw)
+    if m_int:
+        scout = m_int.group(1)
+    return composite, scout
+
+
 def sanity_flags(rows):
-    """Catch the failure that corrupted the April output: a whole team-season
-    where one column collapses to a single repeated value (every player #31/DB).
-    Positional parsing produces exactly this when the table shifts."""
+    """Catch the alignment failure that corrupted the April export: a column
+    collapsing to one repeated value across a whole team-season."""
     flags = []
     if len(rows) < 20:
         return flags
@@ -332,71 +279,60 @@ def sanity_flags(rows):
 
 
 def parse_roster_html(html, team, season):
-    """Extract roster rows. Table layout first (verified for 2018-2025), then a
-    non-table fallback that captures identity fields with confidence and leaves
-    unmatched columns blank."""
+    """Zip the Name table against the data table by row index. Never index
+    anchors against data rows — walk-ons have no anchor."""
     soup = BeautifulSoup(html, 'lxml')
-
-    table_rows = _table_rows(soup)
-    if table_rows:
-        row_pairs, mode = table_rows, 'table'
-    else:
-        row_pairs, mode = _list_rows(soup), 'list'
-    if not row_pairs:
+    name_cells, data_rows = _split_roster_tables(soup)
+    if not data_rows:
         return []
 
-    # Global-anchor fallback only for rows with no anchor of their own.
-    global_anchors = []
-    for a in soup.find_all('a', href=True):
-        m = PLAYER_URL_RE.search(a['href'])
-        if m and a.get_text(strip=True):
-            global_anchors.append(_anchor_fields(a, m))
+    if name_cells is None:
+        # Older single-table layout: the anchor lives inside the data row.
+        anchors = []
+        for tr, _ in data_rows:
+            a = None
+            for cand in tr.find_all('a', href=True):
+                m = PLAYER_URL_RE.search(cand['href'])
+                if m and cand.get_text(strip=True):
+                    a = _anchor_fields(cand, m)
+                    break
+            anchors.append(a)
+    else:
+        if len(name_cells) != len(data_rows):
+            print(f"  ⚠ ROW MISMATCH {team} {season}: {len(name_cells)} names vs "
+                  f"{len(data_rows)} data rows — truncating to the shorter; "
+                  f"columns may be misaligned, check the debug dump")
+        anchors = [_name_cell_to_anchor(td) for td in name_cells]
 
+    n = min(len(anchors), len(data_rows))
     rows = []
-    unanchored = 0
-    for idx, (row_el, cells) in enumerate(row_pairs):
-        anchor = _find_row_anchor(row_el)
+    for idx in range(n):
+        anchor = anchors[idx]
         if anchor is None:
-            unanchored += 1
-            if idx < len(global_anchors):
-                anchor = global_anchors[idx]
-            else:
-                continue
-
-        f = _fields_positional(cells) if mode == 'table' else _fields_by_pattern(cells)
-
-        composite_from_roster = ''
-        if f['rating']:
-            m_rating = re.match(r'^\s*(\d*\.\d+)', f['rating'])
-            if m_rating:
-                composite_from_roster = m_rating.group(1)
-
+            continue
+        _tr, cells = data_rows[idx]
+        jersey, pos, height, weight, yr, age, hs, rating = (cells + [''] * 8)[:8]
+        composite, scout = _split_rating(rating)
         row = {
             '247_id': anchor['247_id'],
             'player_name': anchor['name'],
             'team': team,
             'season': season,
-            'jersey': f['jersey'],
-            'position': f['position'],
-            'height': _normalize_height(f['height']),
-            'weight': f['weight'],
-            'class_yr': f['class_yr'],
-            'age': f['age'],
-            'high_school': f['high_school'],
+            'jersey': jersey,
+            'position': pos,
+            'height': _normalize_height(height),
+            'weight': weight,
+            'class_yr': yr,
+            'age': age,
+            'high_school': '' if _is_na(hs) else hs,
             'profile_url': anchor['profile_url'] or '',
             'scrape_ts': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
         }
         for fld in HS_FIELDS + TRANSFER_FIELDS + STATUS_FIELDS:
             row[fld] = ''
-        row['hs_composite_rating'] = composite_from_roster
+        row['hs_composite_rating'] = composite
+        row['hs_scout_rating'] = scout
         rows.append(row)
-
-    if rows and unanchored:
-        print(f"  NOTE: {team} {season} — {unanchored}/{len(row_pairs)} rows had "
-              f"no in-row player link (fell back to page order)")
-    if mode == 'list' and rows:
-        print(f"  NOTE: {team} {season} — parsed via NON-TABLE fallback "
-              f"({len(rows)} rows); check debug dump before trusting columns")
     return rows
 
 
