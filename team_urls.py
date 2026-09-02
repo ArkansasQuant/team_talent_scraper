@@ -175,31 +175,11 @@ TEAM_URLS = {
 }
 
 def team_url(canonical_team, season):
-    """Build the primary roster URL for a given team and season."""
+    """Build the roster URL for a given team and season."""
     if canonical_team not in TEAM_URLS:
         raise KeyError(f"Unknown team: {canonical_team}")
     school_slug, team_slug, team_id, first_fbs = TEAM_URLS[canonical_team]
     return f"https://247sports.com/college/{school_slug}/team/{team_slug}/roster/?year={season}"
-
-
-def team_url_candidates(canonical_team, season):
-    """Ordered list of roster URLs to try for a team-season.
-
-    The `?year=` form is the archive form and is what worked for 2018-2025.
-    For the CURRENT season 247 serves the roster at the bare /roster/ path and
-    the year-scoped form can render without a roster table, so we fall back to
-    the bare path. The scraper logs loudly whenever a fallback is what worked,
-    because the bare path is not year-scoped and the rows may not belong to the
-    requested season.
-    """
-    if canonical_team not in TEAM_URLS:
-        raise KeyError(f"Unknown team: {canonical_team}")
-    school_slug, team_slug, team_id, first_fbs = TEAM_URLS[canonical_team]
-    base = f"https://247sports.com/college/{school_slug}/team/{team_slug}/roster"
-    return [
-        f"{base}/?year={season}",
-        f"{base}/",
-    ]
 
 def is_fbs_in_year(canonical_team, season):
     if canonical_team not in TEAM_URLS:
