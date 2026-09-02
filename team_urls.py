@@ -7,6 +7,12 @@ The URL structure is:
 
 and we append `?year={season}` to get per-season rosters.
 
+247 also serves the same roster at two other URL forms, which the scraper
+uses as fallbacks when the primary form redirects to a different season
+(observed for the current season right after 247 publishes it):
+    https://247sports.com/college/{school_slug}/team/{team_slug}/roster/          (current season, no year)
+    https://247sports.com/team/{team_slug}/roster/?year={season}                  (site-agnostic)
+
 This list is hand-curated and verified against 247sports URLs. Teams that
 joined FBS mid-window have a `first_fbs_year` field so the scraper knows
 to skip earlier seasons (they'll 404 or return FCS rosters).
@@ -136,6 +142,7 @@ TEAM_URLS = {
     'Western Michigan':  ('western-michigan', 'western-michigan-broncos-football-130', 130, 2018),
     'Massachusetts':     ('massachusetts', 'umass-minutemen-football-475', 475, 2018),
     'Northern Illinois': ('northern-illinois', 'northern-illinois-huskies-football-123', 123, 2018),
+    'Sacramento State':  ('sacramento-state', 'sacramento-state-hornets-football-263', 263, 2026),   # listed in 247's 2026 FBS dropdown (MAC)
 
     # Mountain West
     'Air Force':         ('air-force', 'air-force-falcons-football-132', 132, 2018),
@@ -150,6 +157,7 @@ TEAM_URLS = {
     'UNLV':              ('unlv', 'unlv-rebels-football-142', 142, 2018),
     'Utah State':        ('utah-state', 'utah-state-aggies-football-439', 439, 2018),
     'Wyoming':           ('wyoming', 'wyoming-cowboys-football-430', 430, 2018),
+    'North Dakota State':('north-dakota-state', 'north-dakota-state-bison-football-314', 314, 2026),   # listed in 247's 2026 FBS dropdown (MWC)
 
     # Sun Belt
     'Appalachian State': ('appalachian-state', 'appalachian-state-mountaineers-football-350', 350, 2018),
@@ -180,6 +188,21 @@ def team_url(canonical_team, season):
         raise KeyError(f"Unknown team: {canonical_team}")
     school_slug, team_slug, team_id, first_fbs = TEAM_URLS[canonical_team]
     return f"https://247sports.com/college/{school_slug}/team/{team_slug}/roster/?year={season}"
+
+def roster_url_candidates(canonical_team, season):
+    """All URL forms that can serve the (team, season) roster, best first.
+
+    The scraper tries them in order and accepts the first page whose
+    <h1>/<title> season matches `season` and that contains roster rows.
+    """
+    if canonical_team not in TEAM_URLS:
+        raise KeyError(f"Unknown team: {canonical_team}")
+    school_slug, team_slug, team_id, first_fbs = TEAM_URLS[canonical_team]
+    return [
+        f"https://247sports.com/college/{school_slug}/team/{team_slug}/roster/?year={season}",
+        f"https://247sports.com/college/{school_slug}/team/{team_slug}/roster/",
+        f"https://247sports.com/team/{team_slug}/roster/?year={season}",
+    ]
 
 def is_fbs_in_year(canonical_team, season):
     if canonical_team not in TEAM_URLS:
