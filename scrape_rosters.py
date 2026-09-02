@@ -19,13 +19,17 @@ Rating columns:
   - roster_stars:        count of gold star icons in the roster Rating cell
                          (blank if 247 renders no icons there).
 
-Roster page structure (verified Sep 2026):
-  The roster is TWO side-by-side <table>s — a one-column "Name" table
-  (frozen column) and the Jersey|POS|Height|Weight|Yr|Age|High School|Rating
-  data table. Rows pair by index. Players with no 247 profile are plain text
-  in the Name table (2026) or link to a placeholder /player/--<id>/ (2025 and
-  earlier). The old parser required one <a> per data row and returned 0 rows
-  for every 2026 page.
+Roster page structure (verified against the live DOM, Sep 2026):
+  section.stats-page__content--roster > div.table-container
+    table.name-table[data-id=name] > tbody > tr[data-row=N] > td.name > a|text
+    div.scroll-table-container > table[data-id=data] > tbody > tr[data-row=N]
+      > td x8: Jersey | POS | Height | Weight | Yr | Age | High School | Rating
+      Rating td: <span class="rating">90</span> + span.icon-starsolid.yellow x N
+      (or the text "NA" when unrated)
+  The two tables pair by the tr[data-row] index. Players with no 247 profile
+  are plain text in the Name table (2026) or link to a placeholder
+  /player/--<id>/ (2025 and earlier). The old parser required one <a> per
+  data row and returned 0 rows for every 2026 page.
 
 Design principles (from scraping playbook):
   - Playwright + domcontentloaded (NOT networkidle)
@@ -108,6 +112,17 @@ PROFILE_CACHE_SCHEMA = 8
 CHECKPOINT_DIR = Path("checkpoints")
 PROFILE_CACHE_FILE = CHECKPOINT_DIR / "profiles_cache.json"
 
+# Optional outbound proxy for the browser, e.g. a residential proxy when the
+# machine's own IP is blocked by 247's edge (GitHub-hosted runners are Azure
+# datacenter IPs). Format: http://user:pass@host:port  or  http://host:port
+SCRAPE_PROXY = os.environ.get('SCRAPE_PROXY', '').strip()
+
+# Response headers worth logging when a page comes back empty — they show
+# which edge/bot-manager answered and whether it was a 403.
+DIAG_HEADERS = ('server', 'content-type', 'content-length', 'location',
+                'cf-ray', 'cf-mitigated', 'x-reference-error', 'akamai-grn',
+                'x-akamai-request-id', 'x-cache', 'via', 'x-cdn', 'set-cookie')
+
 # Regex to extract 247 ID from player URL, e.g. /player/carlton-martial-91227/
 PLAYER_URL_RE = re.compile(r'/player/([^/]*?)-(\d+)/?$')
 
@@ -161,6 +176,24 @@ ALL_OUTPUT_COLS = [
 
 def _now_iso():
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _proxy_kwargs():
+    """Translate SCRAPE_PROXY into playwright's launch(proxy=...) dict."""
+    if not SCRAPE_PROXY:
+        return {}
+    from urllib.parse import urlsplit
+    u = urlsplit(SCRAPE_PROXY)
+    if not u.hostname:
+        print(f"  WARN: SCRAPE_PROXY not understood ({SCRAPE_PROXY!r}); ignoring")
+        return {}
+    proxy = {'server': f"{u.scheme or 'http'}://{u.hostname}"
+                       + (f":{u.port}" if u.port else '')}
+    if u.username:
+        proxy['username'] = u.username
+    if u.password:
+        proxy['password'] = u.password
+    return {'proxy': proxy}
 
 
 def _is_na(s):
@@ -245,8 +278,18 @@ def _name_cell(cell):
 
 
 def _rating_cell(cell):
-    """Parse the Rating cell → (composite_decimal, raw_rating, stars)."""
-    text = cell.get_text(' ', strip=True) if cell is not None else ''
+    """Parse the Rating cell → (composite_decimal, raw_rating, stars).
+
+    Live DOM: <td class="textleft" data-sort="90"><span class="rating">90</span>
+              <span class="icon-starsolid yellow">…</span> x N</td>
+    Unrated:  <td class="textleft" data-sort="0">NA</td>
+    """
+    text = ''
+    if cell is not None:
+        span = cell.select_one('span.rating')
+        text = span.get_text(' ', strip=True) if span else cell.get_text(' ', strip=True)
+        if not text and cell.get('data-sort'):
+            text = str(cell.get('data-sort')).strip()
     composite = ''
     raw = ''
     if text and not _is_na(text):
@@ -289,11 +332,15 @@ def parse_roster_html(html, team, season, diag=None):
     diag = diag if diag is not None else {}
     soup = BeautifulSoup(html, 'lxml')
 
-    name_table = None
-    data_table = None
+    # Exact selectors from the live DOM first…
+    name_table = soup.select_one('table.name-table, table[data-id="name"]')
+    data_table = soup.select_one('table[data-id="data"]')
     tables = soup.find_all('table')
     diag['n_tables'] = len(tables)
+    # …then header sniffing for anything 247 renames later.
     for table in tables:
+        if name_table is not None and data_table is not None:
+            break
         header, trs = _header_cells(table)
         if len(trs) < 2:
             continue
@@ -318,18 +365,22 @@ def parse_roster_html(html, team, season, diag=None):
     # ---- data rows (keep the cell elements, we need the Rating cell) ----
     data_header, data_trs = _header_cells(data_table)
     name_in_data = bool(data_header) and data_header[0] == 'name'
-    data_rows = []
+    data_rows = []      # list of cell lists
+    data_keys = []      # tr[data-row] value (or None) per data row
     for tr in data_trs[1:]:
         cells = tr.find_all(['td', 'th'])
         if len(cells) < (7 if name_in_data else 6):
             continue
         data_rows.append(cells)
+        data_keys.append(tr.get('data-row'))
     diag['n_data_rows'] = len(data_rows)
 
     # ---- name rows ----
     name_rows = []
+    name_keys = []
     if name_in_data:
         name_rows = [_name_cell(cells[0]) for cells in data_rows]
+        name_keys = list(data_keys)
         data_rows = [cells[1:] for cells in data_rows]
     elif name_table is not None:
         _, name_trs = _header_cells(name_table)
@@ -338,6 +389,7 @@ def parse_roster_html(html, team, season, diag=None):
             if not cells:
                 continue
             name_rows.append(_name_cell(cells[0]))
+            name_keys.append(tr.get('data-row'))
     diag['n_name_rows'] = len(name_rows)
     diag['n_anchors'] = sum(1 for r in name_rows if r['247_id'])
 
@@ -374,12 +426,27 @@ def parse_roster_html(html, team, season, diag=None):
         diag['n_name_rows'] = len(name_rows)
         diag['n_anchors'] = best[0]
         diag['pairing'] = 'anchor-window fallback'
-    elif len(name_rows) != len(data_rows):
-        diag['pairing'] = (f'WARNING row-count mismatch: {len(name_rows)} names vs '
-                           f'{len(data_rows)} data rows — paired by index up to the shorter list')
-        print(f"  WARN {team} {season}: {diag['pairing']}")
     else:
-        diag['pairing'] = 'name-table + data-table by index'
+        keyed = (all(k is not None for k in name_keys) and all(k is not None for k in data_keys)
+                 and len(set(name_keys)) == len(name_keys) and len(set(data_keys)) == len(data_keys))
+        if keyed:
+            # Live DOM: both tables carry tr[data-row="N"] → join on it.
+            by_key = dict(zip(data_keys, data_rows))
+            pairs = [(nm, by_key[k]) for nm, k in zip(name_rows, name_keys) if k in by_key]
+            missing = len(name_rows) - len(pairs)
+            diag['pairing'] = 'joined on tr[data-row]' + (f' ({missing} names without a data row)' if missing else '')
+            if missing or len(data_rows) != len(name_rows):
+                print(f"  WARN {team} {season}: {len(name_rows)} names vs {len(data_rows)} "
+                      f"data rows; {len(pairs)} paired on data-row")
+        else:
+            pairs = list(zip(name_rows, data_rows))
+            if len(name_rows) != len(data_rows):
+                diag['pairing'] = (f'WARNING row-count mismatch: {len(name_rows)} names vs '
+                                   f'{len(data_rows)} data rows — paired by index up to the shorter list')
+                print(f"  WARN {team} {season}: {diag['pairing']}")
+            else:
+                diag['pairing'] = 'name-table + data-table by index'
+        name_rows, data_rows = [p[0] for p in pairs], [p[1] for p in pairs]
 
     rows = []
     ts = _now_iso()
@@ -834,7 +901,21 @@ async def scrape_team_season(page, team, season, verbose=False, diag=None):
     for url in roster_url_candidates(team, season):
         info = {'url': url}
         try:
-            await page.goto(url, wait_until='domcontentloaded', timeout=NAV_TIMEOUT_MS)
+            resp = await page.goto(url, wait_until='domcontentloaded', timeout=NAV_TIMEOUT_MS)
+            if resp is not None:
+                info['status'] = resp.status
+                try:
+                    hdrs = resp.headers or {}
+                    info['headers'] = {k: v[:120] for k, v in hdrs.items()
+                                       if k.lower() in DIAG_HEADERS}
+                except Exception:
+                    pass
+                try:
+                    body = await resp.text()
+                    info['body_len'] = len(body)
+                    info['body_head'] = body[:160].replace('\n', ' ')
+                except Exception:
+                    pass
         except PlaywrightTimeoutError:
             info['reason'] = 'goto timeout'
             nav_failures += 1
@@ -891,6 +972,14 @@ def _describe_attempts(diag):
         bits = [f"{k}) {a.get('url')}"]
         if a.get('final_url') and a.get('final_url') != a.get('url'):
             bits.append(f"→ {a['final_url']}")
+        if 'status' in a:
+            bits.append(f"HTTP {a['status']}")
+        if 'body_len' in a:
+            bits.append(f"body={a['body_len']}B")
+        if a.get('headers'):
+            bits.append('headers=' + ', '.join(f"{k}={v}" for k, v in a['headers'].items()))
+        if a.get('body_head'):
+            bits.append(f"body_head={a['body_head']!r}")
         if 'title' in a:
             bits.append(f"title={a.get('title')!r}")
         if 'page_year' in a:
@@ -1014,7 +1103,10 @@ async def run(seasons, teams, output, skip_existing=True,
     new_profiles_this_run = 0
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        launch_kwargs = _proxy_kwargs()
+        if launch_kwargs:
+            print(f"  Using proxy {launch_kwargs['proxy']['server']}")
+        browser = await p.chromium.launch(headless=True, **launch_kwargs)
         ctx_kwargs = dict(user_agent=random.choice(USER_AGENTS),
                           viewport={'width': 1280, 'height': 900})
         context = await browser.new_context(**ctx_kwargs)
@@ -1176,6 +1268,9 @@ async def run(seasons, teams, output, skip_existing=True,
             print("  (none — all team-seasons have 40-200 rows, nominal)")
     else:
         print("No data collected.")
+        if tasks:
+            print("Exiting 2 so the workflow shows red instead of a green 'success' with no CSV.")
+            sys.exit(2)
 
 
 def main():
